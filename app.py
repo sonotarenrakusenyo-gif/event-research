@@ -730,15 +730,41 @@ _PAGE_JUNK_KEYWORDS = [
 ]
 
 
+# 「イベント・展示会の名称」を示す語（企業名ではない）
+_EVENT_INDICATORS = [
+    "展示会", "展示", "見本市", "博覧会", "EXPO", "Expo", "expo",
+    "ウィーク", "Week", "WEEK", "フェア", "フェスタ", "フェスティバル",
+    "サミット", "Summit", "フォーラム", "Forum", "商談会", "同時開催",
+    "カンファレンス", "コンファレンス", "セミナー", "講演会", "シンポジウム",
+    "メッセ", "ショー", "Show", "祭", "総合展",
+]
+
+# 企業（法人）であることを示す語
+_COMPANY_MARKERS = [
+    "株式会社", "有限会社", "合同会社", "(株)", "（株）", "(有)", "（有）",
+    "一般社団法人", "公益財団法人", "協同組合",
+    "Inc", "Corp", "Co.,Ltd", "Co., Ltd", "Ltd", "LLC", "K.K", "GmbH",
+]
+
+
 def _is_junk_page_title(title: str, event_title: str) -> bool:
-    """検索結果のページタイトルが企業ページでない（案内・一覧・事務局等）か判定する。"""
+    """
+    検索結果のタイトル/抽出名が「企業」でない（案内・一覧・事務局・
+    イベント名そのもの等）かを判定する。
+    """
     if not title or len(title) < 3:
         return True
     if any(kw in title for kw in _PAGE_JUNK_KEYWORDS):
         return True
-    # タイトルがイベント名そのもの（企業名でなくイベント告知ページ）
-    if event_title and event_title in title and "株式会社" not in title and "有限会社" not in title:
-        return True
+
+    has_company_marker = any(m in title for m in _COMPANY_MARKERS)
+    if not has_company_marker:
+        # 法人格がなく、イベント名を示す語を含む → 企業ではない
+        if any(ind in title for ind in _EVENT_INDICATORS):
+            return True
+        # 法人格がなく、対象イベント名そのもの → 企業ではない
+        if event_title and event_title in title:
+            return True
     return False
 
 
@@ -798,6 +824,7 @@ def _fetch_page_companies(event_url: str) -> list[dict]:
                         and parsed.netloc != event_domain
                         and name and len(name) >= 3
                         and not _is_junk_company(name, parsed.netloc)
+                        and not _is_junk_page_title(name, "")
                     ):
                         companies.append({
                             "name": name,
@@ -909,8 +936,8 @@ def extract_companies_with_gemini(
     page_excerpt = (page_text or "")[:3000]
 
     prompt = f"""あなたは日本の展示会・イベントのリサーチ専門家です。
-イベント「{event_name}」（ジャンル: {genre_label}）に出展・協賛・主催している【実在の企業・法人】を、
-以下のイベントページ本文とWeb検索結果から可能な限り多く抽出してください。
+イベント「{event_name}」（ジャンル: {genre_label}）に【出展・協賛・主催する実在の企業・法人】を、
+できるだけ多く（最大40社）リストアップしてください。
 
 【イベントページ本文（抜粋）】
 {page_excerpt}
@@ -918,13 +945,22 @@ def extract_companies_with_gemini(
 【Web検索結果】
 {corpus}
 
-【抽出ルール】
-- 実在する企業・法人のみ（株式会社・有限会社・合同会社・Inc・Corp・Co.,Ltd・著名なブランド企業名など）
-- 「出展のご案内」「出展社一覧」「イベント情報」「事務局」「○○EXPO」などのページ名・イベント名そのものは企業ではないので除外
-- メディア記事・まとめサイト・比較サイトは企業として含めない
+【手順】
+1. まず上記のページ本文・検索結果の中に出てくる実在企業名を拾う
+2. それだけで少ない場合は、このイベント・ジャンル（{genre_label}）に
+   実際に出展・協賛しそうな【実在する日本企業】をあなたの知識から補う
+   （※存在しない企業を創作することは絶対に禁止。実在が確実な企業のみ）
+
+【厳守する除外ルール】
+- 企業（法人・事業者）のみを出力する
+- 次は企業ではないので必ず除外:
+  ・「○○展」「○○EXPO」「○○Week」「○○フェア」「見本市」「博覧会」「総合展」など展示会・イベントの名称
+  ・「同時開催」「主催者一覧」「出展社一覧」「出展のご案内」などのページ名
+  ・「お問い合わせ」「アクセス」「会場案内」「事務局」などのページ要素
+  ・メディア記事・まとめサイト・比較サイト・行政の告知ページ
 - 同じ企業の重複は1つにまとめる
-- 公式サイトのURLが分かる場合のみ url に記載し、不明な場合は空文字 "" にする（推測のURLは書かない）
-- できるだけ多く（最大40社）挙げる
+- 企業名には可能なら法人格（株式会社など）を含める
+- 公式サイトのURLが分かる場合のみ url に記載し、不明な場合は空文字 "" にする（推測・架空のURLは書かない）
 
 【出力】JSON配列のみ（説明文は不要）:
 [
@@ -946,7 +982,11 @@ def extract_companies_with_gemini(
                     name = str(item["name"]).strip()
                     url = str(item.get("url", "") or "").strip()
                     domain = urlparse(url).netloc if url else ""
-                    if name and not _is_junk_page_title(name, event_name):
+                    if (
+                        name
+                        and not _is_junk_page_title(name, event_name)
+                        and not _is_junk_company(name, domain)
+                    ):
                         out.append({
                             "name": name,
                             "url": url,
