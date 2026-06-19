@@ -1864,7 +1864,7 @@ def render_step4(cfg: dict) -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="イベント関連企業リサーチツール",
+        page_title="お仕事受注企業選定ツール",
         page_icon="🎯",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -1872,7 +1872,7 @@ def main() -> None:
 
     init_session_state()
 
-    st.title("🎯 イベント関連企業 完全自動リサーチ・絞り込みツール")
+    st.title("🎯 お仕事受注企業選定ツール")
     st.caption(
         "ジャンル選択 → Google ＋ Gemini で全自動イベント検索 → 企業収集 → AI絞り込み → CSV出力\n"
         "エル・アミティエ・フェアリィ関連は企業段階で自動除外"
