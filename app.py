@@ -83,7 +83,7 @@ OUTPUT_COLUMNS = [
     "書き込み日時",
 ]
 
-MAX_SEARCH_RESULTS_PER_QUERY = 10
+MAX_SEARCH_RESULTS_PER_QUERY = 20
 
 # ============================================================
 # イベントジャンル一覧（50カテゴリ）
@@ -550,10 +550,10 @@ def validate_events_with_gemini(
         target_years = [this_year, this_year + 1]
     years_text = "・".join(f"{y}年" for y in target_years)
 
-    # Geminiに渡す候補テキストを作成（最大20件）
+    # Geminiに渡す候補テキストを作成（最大40件）
     items_text = "\n".join([
         f"[{i + 1}] タイトル: {c['title']}\n    URL: {c['url']}\n    概要: {c['snippet']}"
-        for i, c in enumerate(candidates[:20])
+        for i, c in enumerate(candidates[:40])
     ])
 
     prompt = f"""あなたは日本のイベントリサーチ専門家です。
@@ -566,11 +566,11 @@ def validate_events_with_gemini(
 
 【抽出ルール】
 - 企業の製品ページ・トップページ・ニュース記事など、イベント自体でないURLは除外
-- 【最重要】本日（{today_str}）より後に開催される「開催予定」のイベントのみ抽出する
-- すでに終了した過去のイベントは必ず除外する（開催日が本日より前のものは含めない）
-- 開催年は {years_text} を対象とする
-- 毎年定期開催される展示会・セミナーは、次回開催が今後見込めるため含めてよい
-- 開催時期が不明で過去か未来か判断できない場合は、含めない（未来と確認できるものだけ）
+- 【最重要】明らかに終了した過去のイベント（開催日が本日 {today_str} より前と確認できるもの）は除外する
+- 開催年は {years_text} を中心に対象とする
+- 毎年定期開催される展示会・セミナーは、次回開催が今後見込めるため含める
+- 開催時期が不明・曖昧で過去か未来か判断できない場合は、念のため含めてよい（除外しすぎない）
+- 同種のイベントが複数あればできるだけ多く列挙する（最大40件まで）
 - MCやナレーターが活躍するステージ・ブース・司会進行がありそうなイベントを優先
 - エル・アミティエ・フェアリィが関わっていてもイベント段階では除外しない
 
@@ -621,7 +621,7 @@ def validate_events_with_gemini(
             "format": "不明",
             "snippet": c.get("snippet", ""),
         }
-        for c in candidates[:15]
+        for c in candidates[:25]
     ]
 
 
@@ -1079,7 +1079,7 @@ def render_sidebar() -> dict:
         st.subheader("🔍 イベント検索設定")
         max_queries = st.slider(
             "ジャンルキーワードの使用数",
-            min_value=1, max_value=5, value=3,
+            min_value=1, max_value=5, value=5,
             help="多いほど多くのイベントを発見できますが、検索APIの消費が増えます",
         )
 
