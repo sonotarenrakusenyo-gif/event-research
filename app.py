@@ -629,10 +629,40 @@ def validate_events_with_gemini(
 # STEP 2: 企業リスト収集
 # ============================================================
 
+_JUNK_DOMAINS = {
+    "twitter.com", "x.com", "facebook.com", "instagram.com",
+    "youtube.com", "linkedin.com", "line.me", "tiktok.com",
+    "google.com", "google.co.jp", "apple.com", "amazon.co.jp",
+    "amazon.com", "wikipedia.org",
+}
+
+_JUNK_NAME_KEYWORDS = [
+    "プライバシー", "個人情報", "利用規約", "ご利用条件", "cookie",
+    "Cookie", "バリアフリー", "サイトマップ", "アクセシビリティ",
+    "facebook", "twitter", "instagram", "youtube", "linkedin",
+    "X (formerly", "お問い合わせ", "トップへ", "ページトップ",
+]
+
+
+def _is_junk_company(name: str, domain: str) -> bool:
+    """SNSリンク・フッターナビ・汎用ページなど企業でないリンクを判定する。"""
+    domain_lower = domain.lower()
+    if any(jd in domain_lower for jd in _JUNK_DOMAINS):
+        return True
+    name_lower = name.lower()
+    if any(kw.lower() in name_lower for kw in _JUNK_NAME_KEYWORDS):
+        return True
+    # 日本語・英字が1文字もない（記号・数字だけ）
+    if not re.search(r"[ぁ-んァ-ンa-zA-Z一-龥]", name):
+        return True
+    return False
+
+
 def _fetch_page_companies(event_url: str) -> list[dict]:
     """
     イベントページを直接スクレイピングし、
     主催・出展・スポンサーセクションのリンクから企業情報を収集する。
+    SNS・フッターナビ・汎用ページは除外する。
     """
     companies: list[dict] = []
     section_keywords = [
@@ -650,6 +680,11 @@ def _fetch_page_companies(event_url: str) -> list[dict]:
         resp = requests.get(event_url, headers=headers, timeout=12)
         resp.encoding = resp.apparent_encoding
         soup = BeautifulSoup(resp.text, "lxml")
+
+        # フッター・ナビゲーション・SNS枠はスクレイピング対象から除外
+        for tag in soup(["footer", "nav", "header"]):
+            tag.decompose()
+
         event_domain = urlparse(event_url).netloc
 
         for block in soup.find_all(["section", "div", "article", "li"]):
@@ -663,7 +698,8 @@ def _fetch_page_companies(event_url: str) -> list[dict]:
                         parsed.scheme in ("http", "https")
                         and parsed.netloc
                         and parsed.netloc != event_domain
-                        and name and len(name) >= 2
+                        and name and len(name) >= 3
+                        and not _is_junk_company(name, parsed.netloc)
                     ):
                         companies.append({
                             "name": name,
@@ -714,13 +750,14 @@ def _search_related_companies(
 
     queries = [
         f'"{event_title}" 出展企業 OR 主催者 OR 運営会社',
-        f'"{event_title}" セミナー OR 講演会 OR 自社開催 東京',
-        f'"{event_title}" TKP OR 貸し会議室 OR スポンサー OR 協賛',
+        f'"{event_title}" 出展社 OR 出展者一覧',
+        f'{event_title} セミナー OR 講演会 OR 自社開催 東京',
+        f'{event_title} スポンサー OR 協賛企業',
     ]
     if extra_keyword:
-        queries.append(f'"{event_title}" {extra_keyword}')
+        queries.append(f'{event_title} {extra_keyword}')
 
-    for query in queries[:4]:
+    for query in queries[:5]:
         results = _serpapi_search(query, serpapi_key, MAX_SEARCH_RESULTS_PER_QUERY)
         for item in results:
             url = item.get("link", "")
