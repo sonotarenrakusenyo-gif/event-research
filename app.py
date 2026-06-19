@@ -482,6 +482,7 @@ def auto_research_events(
     genre: dict,
     serpapi_key: str,
     max_queries: int = 3,
+    target_years: "list[int] | None" = None,
 ) -> list[dict]:
     """
     選択ジャンルのキーワードを使ってSerpAPI（Google検索）で検索し、
@@ -489,6 +490,7 @@ def auto_research_events(
 
     Args:
         max_queries: 使用するキーワード数の上限（APIクォータ節約）
+        target_years: 検索対象の開催年リスト（未指定なら今年・来年）
 
     Returns:
         list of {title, url, snippet}
@@ -496,14 +498,19 @@ def auto_research_events(
     candidates: list[dict] = []
     seen_urls: set[str] = set()
 
+    if not target_years:
+        this_year = datetime.now().year
+        target_years = [this_year, this_year + 1]
+    year_part = " OR ".join(str(y) for y in target_years)
+
     keywords = genre.get("keywords", [])[:max_queries]
 
     for kw in keywords:
-        # 東京近郊 + 展示会/セミナー/講演会 を付加して絞り込む
+        # 東京近郊 + 展示会/セミナー/講演会 + 対象年 を付加して絞り込む
         query = (
             f"{kw} 東京 OR 幕張 OR 横浜 OR 川崎 OR さいたま OR 千葉 "
             f"展示会 OR セミナー OR 講演会 OR カンファレンス OR 自社イベント "
-            f"2025 OR 2026"
+            f"{year_part}"
         )
         results = _serpapi_search(query, serpapi_key, MAX_SEARCH_RESULTS_PER_QUERY)
         for item in results:
@@ -524,10 +531,11 @@ def validate_events_with_gemini(
     candidates: list[dict],
     genre_label: str,
     gemini_api_key: str,
+    target_years: "list[int] | None" = None,
 ) -> list[dict]:
     """
     Google検索で得たイベント候補をGeminiに一括送信し、
-    実際の東京近郊イベントを整理・抽出したリストを返す。
+    実際の東京近郊で「これから開催される」イベントを整理・抽出したリストを返す。
     1回のAPI呼び出しで完結（レートリミット対策）。
 
     Returns:
@@ -536,6 +544,12 @@ def validate_events_with_gemini(
     if not candidates:
         return []
 
+    today_str = datetime.now().strftime("%Y年%m月%d日")
+    if not target_years:
+        this_year = datetime.now().year
+        target_years = [this_year, this_year + 1]
+    years_text = "・".join(f"{y}年" for y in target_years)
+
     # Geminiに渡す候補テキストを作成（最大20件）
     items_text = "\n".join([
         f"[{i + 1}] タイトル: {c['title']}\n    URL: {c['url']}\n    概要: {c['snippet']}"
@@ -543,15 +557,20 @@ def validate_events_with_gemini(
     ])
 
     prompt = f"""あなたは日本のイベントリサーチ専門家です。
+本日は {today_str} です。
 以下のGoogle検索結果から、【{genre_label}】に関連する「展示会・見本市・セミナー・講演会・カンファレンス・配信イベント」を特定し、
-東京都内または東京近郊（神奈川・千葉・埼玉の東京寄りエリア）で開催される（または開催された）イベントのみを抽出してください。
+東京都内または東京近郊（神奈川・千葉・埼玉の東京寄りエリア）で、【本日以降に開催される未来のイベント】のみを抽出してください。
 
 【検索結果】
 {items_text}
 
 【抽出ルール】
 - 企業の製品ページ・トップページ・ニュース記事など、イベント自体でないURLは除外
-- 過去・今後どちらのイベントも含める
+- 【最重要】本日（{today_str}）より後に開催される「開催予定」のイベントのみ抽出する
+- すでに終了した過去のイベントは必ず除外する（開催日が本日より前のものは含めない）
+- 開催年は {years_text} を対象とする
+- 毎年定期開催される展示会・セミナーは、次回開催が今後見込めるため含めてよい
+- 開催時期が不明で過去か未来か判断できない場合は、含めない（未来と確認できるものだけ）
 - MCやナレーターが活躍するステージ・ブース・司会進行がありそうなイベントを優先
 - エル・アミティエ・フェアリィが関わっていてもイベント段階では除外しない
 
@@ -1061,7 +1080,17 @@ def render_sidebar() -> dict:
         max_queries = st.slider(
             "ジャンルキーワードの使用数",
             min_value=1, max_value=5, value=3,
-            help="多いほど多くのイベントを発見できますが、Google APIの消費が増えます",
+            help="多いほど多くのイベントを発見できますが、検索APIの消費が増えます",
+        )
+
+        st.subheader("📅 対象年（未来の開催のみ）")
+        current_year = datetime.now().year
+        year_options = [current_year + i for i in range(0, 4)]
+        target_years = st.multiselect(
+            "検索する開催年",
+            options=year_options,
+            default=[current_year, current_year + 1],
+            help="選んだ年に開催される未来のイベントだけを抽出します（過去は除外）",
         )
 
         st.subheader("🚫 除外フィルタ")
@@ -1086,6 +1115,7 @@ def render_sidebar() -> dict:
         "gs_sheet_name": gs_sheet_name,
         "delay_seconds": delay_seconds,
         "max_queries": max_queries,
+        "target_years": target_years,
         "additional_exclusions": additional_exclusions,
     }
 
@@ -1152,7 +1182,7 @@ def render_step1(cfg: dict) -> None:
         # ステップA: SerpAPI（Google検索）
         with st.spinner(f"🔍 Googleで「{selected_label}」関連イベントを検索中…"):
             candidates = auto_research_events(
-                genre, cfg["serpapi_key"], cfg["max_queries"]
+                genre, cfg["serpapi_key"], cfg["max_queries"], cfg["target_years"]
             )
 
         if not candidates:
@@ -1164,7 +1194,7 @@ def render_step1(cfg: dict) -> None:
         # ステップB: Gemini整理
         with st.spinner("🤖 GeminiがイベントリストをAIで整理中（1〜2分かかる場合があります）…"):
             events = validate_events_with_gemini(
-                candidates, selected_label, cfg["gemini_api_key"]
+                candidates, selected_label, cfg["gemini_api_key"], cfg["target_years"]
             )
 
         st.session_state.events = events
