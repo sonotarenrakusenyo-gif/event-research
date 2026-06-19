@@ -1030,16 +1030,16 @@ def collect_companies(
     raw: list[dict] = []
 
     # ① イベントページ直接スクレイピング（実URLが取れる）
-    raw.extend(_fetch_page_companies(event_url))
+    page_companies = _fetch_page_companies(event_url)
+    raw.extend(page_companies)
 
     # ② 検索結果を集め、Geminiで実在企業名を抽出
     search_results = _gather_search_results(event_name, serpapi_key, extra_keyword)
     page_text = _scrape_company_page(event_url, max_chars=4000)
-    raw.extend(
-        extract_companies_with_gemini(
-            event_name, genre_label, search_results, page_text, gemini_api_key
-        )
+    extracted = extract_companies_with_gemini(
+        event_name, genre_label, search_results, page_text, gemini_api_key
     )
+    raw.extend(extracted)
 
     seen_names: set[str] = set()
     seen_domains: set[str] = set()
@@ -1059,7 +1059,13 @@ def collect_companies(
             seen_domains.add(domain)
         deduped.append({**c, "event_name": event_name})
 
-    return deduped
+    stats = {
+        "page_links": len(page_companies),
+        "search_results": len(search_results),
+        "ai_extracted": len(extracted),
+        "final": len(deduped),
+    }
+    return deduped, stats
 
 
 # ============================================================
@@ -1584,7 +1590,7 @@ def render_step2(cfg: dict) -> None:
             return
 
         with st.spinner("企業情報を収集中…（30秒〜1分程度かかる場合があります）"):
-            raw_companies = collect_companies(
+            raw_companies, collect_stats = collect_companies(
                 event,
                 cfg["serpapi_key"],
                 cfg["gemini_api_key"],
@@ -1595,10 +1601,32 @@ def render_step2(cfg: dict) -> None:
         valid, excluded = apply_exclusion_filter(raw_companies, cfg["additional_exclusions"])
         st.session_state.companies = valid
         st.session_state.excluded_companies = excluded
+        st.session_state.collect_stats = collect_stats
         st.session_state.ai_results = []
         st.session_state.filtered_companies = []
 
         st.success(f"✅ 収集完了: **{len(valid)} 社**（除外: {len(excluded)} 社）")
+
+    # 収集の内訳（どの工程で何件取れたか）を表示
+    stats = st.session_state.get("collect_stats")
+    if stats:
+        with st.expander("🔍 収集の内訳（うまく取れない時はここを確認）", expanded=False):
+            st.markdown(
+                f"- イベントページから直接取得: **{stats.get('page_links', 0)} 件**\n"
+                f"- Google検索のヒット件数: **{stats.get('search_results', 0)} 件**\n"
+                f"- AIが検索結果から抽出した企業: **{stats.get('ai_extracted', 0)} 社**\n"
+                f"- 重複除去後の最終件数: **{stats.get('final', 0)} 社**"
+            )
+            if stats.get("search_results", 0) == 0:
+                st.warning(
+                    "Google検索が0件です。SerpAPIキー、または月100回の無料枠を"
+                    "使い切っていないか確認してください。"
+                )
+            elif stats.get("ai_extracted", 0) == 0:
+                st.warning(
+                    "AI抽出が0社です。Geminiのレート制限（待機後に再試行）か、"
+                    "検索結果に企業名が含まれていない可能性があります。"
+                )
 
     if st.session_state.excluded_companies:
         with st.expander(f"🚫 除外された企業 ({len(st.session_state.excluded_companies)} 社)"):
@@ -1620,7 +1648,14 @@ def render_step2(cfg: dict) -> None:
             }),
             use_container_width=True, hide_index=True,
         )
-        st.info("➡️ STEP3 タブで AI による絞り込みを実行してください")
+        st.success(
+            "✅ この企業リストは自動的に次の工程へ引き継がれます。"
+            "**企業名をタップする必要はありません。**"
+        )
+        st.info(
+            "➡️ 次の進み方：画面上部の **「🤖 STEP3: AI絞り込み」タブ** をクリックし、"
+            "**「🤖 AI判定を開始する」ボタン** を押してください。"
+        )
 
 
 # ============================================================
