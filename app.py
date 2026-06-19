@@ -466,7 +466,9 @@ def _serpapi_search(query: str, api_key: str, num: int = 10) -> list[dict]:
         resp.raise_for_status()
         data = resp.json()
         if data.get("error"):
-            st.warning(f"SerpAPIエラー: {data['error']}")
+            # 「ヒット0件」は正常な結果なので警告しない
+            if "hasn't returned any results" not in data["error"]:
+                st.warning(f"SerpAPIエラー: {data['error']}")
             return []
         return data.get("organic_results", [])
     except Exception as exc:
@@ -643,6 +645,27 @@ _JUNK_NAME_KEYWORDS = [
     "X (formerly", "お問い合わせ", "トップへ", "ページトップ",
 ]
 
+# 検索結果のページタイトルが「企業」でないと判断するためのキーワード
+_PAGE_JUNK_KEYWORDS = [
+    "出展のご案内", "出展案内", "出展募集", "出展のご相談", "ご案内",
+    "イベント情報", "開催概要", "開催情報", "事務局", "とは",
+    "一覧", "まとめ", "について", "特集", "ニュース", "プレスリリース",
+    "比較", "おすすめ", "選び方", "見本市", "展示会一覧", "スケジュール",
+    "来場", "チケット", "入場", "アクセス", "会場案内", "FAQ", "よくある",
+]
+
+
+def _is_junk_page_title(title: str, event_title: str) -> bool:
+    """検索結果のページタイトルが企業ページでない（案内・一覧・事務局等）か判定する。"""
+    if not title or len(title) < 3:
+        return True
+    if any(kw in title for kw in _PAGE_JUNK_KEYWORDS):
+        return True
+    # タイトルがイベント名そのもの（企業名でなくイベント告知ページ）
+    if event_title and event_title in title and "株式会社" not in title and "有限会社" not in title:
+        return True
+    return False
+
 
 def _is_junk_company(name: str, domain: str) -> bool:
     """SNSリンク・フッターナビ・汎用ページなど企業でないリンクを判定する。"""
@@ -741,10 +764,12 @@ def _search_related_companies(
     event_title: str,
     serpapi_key: str,
     extra_keyword: str = "",
+    event_domain: str = "",
 ) -> list[dict]:
     """
     SerpAPI（Google検索）で関連企業を収集する。
     展示会の出展企業だけでなく、セミナー・TKP開催企業も対象。
+    案内ページ・一覧ページ・主催サイト自身のページは除外する。
     """
     companies: list[dict] = []
 
@@ -762,8 +787,16 @@ def _search_related_companies(
         for item in results:
             url = item.get("link", "")
             parsed = urlparse(url)
+            name = item.get("title", "")
+            # 主催サイト自身のページ・SNS・案内/一覧ページは除外
+            if event_domain and parsed.netloc == event_domain:
+                continue
+            if _is_junk_company(name, parsed.netloc):
+                continue
+            if _is_junk_page_title(name, event_title):
+                continue
             companies.append({
-                "name": item.get("title", ""),
+                "name": name,
                 "url": url,
                 "domain": parsed.netloc,
                 "source": f"SerpAPI検索: {query[:25]}…",
@@ -783,10 +816,14 @@ def collect_companies(
     各企業に event_name を付与する。
     """
     event_name = event.get("name", event.get("title", "不明"))
+    event_url = event.get("url", "")
+    event_domain = urlparse(event_url).netloc
     raw: list[dict] = []
 
-    raw.extend(_fetch_page_companies(event.get("url", "")))
-    raw.extend(_search_related_companies(event_name, serpapi_key, extra_keyword))
+    raw.extend(_fetch_page_companies(event_url))
+    raw.extend(
+        _search_related_companies(event_name, serpapi_key, extra_keyword, event_domain)
+    )
 
     seen_domains: set[str] = set()
     deduped: list[dict] = []
