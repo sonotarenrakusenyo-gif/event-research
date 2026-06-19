@@ -40,10 +40,12 @@ EXCLUSION_KEYWORDS: list[str] = [
 ]
 
 # 利用したいGeminiモデルの優先順位（上から順に、使えるものを自動採用）
+# flash-lite は無料枠のレート制限が緩い（1分あたりの回数が多い）ため優先
 GEMINI_MODEL_PREFERENCES = [
+    "gemini-2.5-flash-lite",
+    "gemini-flash-lite-latest",
     "gemini-2.5-flash",
     "gemini-flash-latest",
-    "gemini-3.5-flash",
     "gemini-2.0-flash",
 ]
 
@@ -439,6 +441,39 @@ def resolve_gemini_model() -> str:
     return _RESOLVED_GEMINI_MODEL
 
 
+def gemini_generate(model: "genai.GenerativeModel", prompt: str, max_retries: int = 4):
+    """
+    Geminiを呼び出す。429（無料枠のレート超過）が出たら、指定された
+    retry_delay 秒だけ待ってから自動的に再試行する。
+    """
+    last_exc: "Exception | None" = None
+    for attempt in range(max_retries):
+        try:
+            return model.generate_content(prompt)
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            is_rate_limit = (
+                "429" in msg
+                or "quota" in msg.lower()
+                or "rate limit" in msg.lower()
+                or "exceeded" in msg.lower()
+            )
+            if is_rate_limit and attempt < max_retries - 1:
+                # retry_delay 秒を抽出（なければ指数的に待つ）
+                match = (
+                    re.search(r"retry_delay\D*(\d+)", msg)
+                    or re.search(r"retry in (\d+)", msg)
+                )
+                wait = int(match.group(1)) + 2 if match else 8 * (attempt + 1)
+                wait = min(wait, 60)
+                time.sleep(wait)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+
+
 # ============================================================
 # 検索バックエンド: SerpAPI（Google検索結果を取得）
 # ============================================================
@@ -592,7 +627,7 @@ def validate_events_with_gemini(
     try:
         genai.configure(api_key=gemini_api_key)
         model = genai.GenerativeModel(resolve_gemini_model())
-        response = model.generate_content(prompt)
+        response = gemini_generate(model, prompt)
         parsed = _extract_json(response.text.strip())
 
         if isinstance(parsed, list) and parsed:
@@ -861,7 +896,7 @@ def extract_companies_with_gemini(
     try:
         genai.configure(api_key=gemini_api_key)
         model = genai.GenerativeModel(resolve_gemini_model())
-        response = model.generate_content(prompt)
+        response = gemini_generate(model, prompt)
         parsed = _extract_json(response.text.strip())
 
         out: list[dict] = []
@@ -1076,7 +1111,7 @@ def classify_company(
 
     try:
         prompt = _build_company_prompt(company, page_text, genre_label)
-        response = model.generate_content(prompt)
+        response = gemini_generate(model, prompt)
         parsed = _extract_json(response.text.strip())
 
         if not isinstance(parsed, dict):
