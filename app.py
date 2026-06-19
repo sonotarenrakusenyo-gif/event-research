@@ -12,7 +12,6 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
-from googleapiclient.discovery import build
 import gspread
 from google.oauth2.service_account import Credentials
 import pandas as pd
@@ -392,17 +391,51 @@ def _extract_json(text: str) -> "dict | list | None":
 
 
 # ============================================================
+# 検索バックエンド: SerpAPI（Google検索結果を取得）
+# ============================================================
+
+def _serpapi_search(query: str, api_key: str, num: int = 10) -> list[dict]:
+    """
+    SerpAPI 経由でGoogle検索を実行し、organic_results を返す。
+
+    Returns:
+        list of result dicts（各要素に title / link / snippet を含む）
+    """
+    try:
+        resp = requests.get(
+            "https://serpapi.com/search.json",
+            params={
+                "q": query,
+                "api_key": api_key,
+                "engine": "google",
+                "hl": "ja",
+                "gl": "jp",
+                "num": num,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            st.warning(f"SerpAPIエラー: {data['error']}")
+            return []
+        return data.get("organic_results", [])
+    except Exception as exc:
+        st.warning(f"SerpAPI検索エラー（{query[:20]}）: {exc}")
+        return []
+
+
+# ============================================================
 # STEP 1: 完全自動イベントリサーチ
 # ============================================================
 
 def auto_research_events(
     genre: dict,
-    api_key: str,
-    cx_id: str,
+    serpapi_key: str,
     max_queries: int = 3,
 ) -> list[dict]:
     """
-    選択ジャンルのキーワードを使ってGoogle Custom Search APIで検索し、
+    選択ジャンルのキーワードを使ってSerpAPI（Google検索）で検索し、
     イベント候補（タイトル・URL・スニペット）を収集する。
 
     Args:
@@ -411,7 +444,6 @@ def auto_research_events(
     Returns:
         list of {title, url, snippet}
     """
-    service = build("customsearch", "v1", developerKey=api_key)
     candidates: list[dict] = []
     seen_urls: set[str] = set()
 
@@ -424,24 +456,17 @@ def auto_research_events(
             f"展示会 OR セミナー OR 講演会 OR カンファレンス OR 自社イベント "
             f"2025 OR 2026"
         )
-        try:
-            res = (
-                service.cse()
-                .list(q=query, cx=cx_id, num=MAX_SEARCH_RESULTS_PER_QUERY, lr="lang_ja")
-                .execute()
-            )
-            for item in res.get("items", []):
-                url = item.get("link", "")
-                if url and url not in seen_urls:
-                    seen_urls.add(url)
-                    candidates.append({
-                        "title": item.get("title", ""),
-                        "url": url,
-                        "snippet": item.get("snippet", ""),
-                    })
-            time.sleep(0.4)  # API連続呼び出し間隔
-        except Exception as exc:
-            st.warning(f"Google検索エラー（{kw[:20]}）: {exc}")
+        results = _serpapi_search(query, serpapi_key, MAX_SEARCH_RESULTS_PER_QUERY)
+        for item in results:
+            url = item.get("link", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                candidates.append({
+                    "title": item.get("title", ""),
+                    "url": url,
+                    "snippet": item.get("snippet", ""),
+                })
+        time.sleep(0.4)  # API連続呼び出し間隔
 
     return candidates
 
@@ -610,15 +635,13 @@ def _scrape_company_page(url: str, max_chars: int = 2500) -> str:
 
 def _search_related_companies(
     event_title: str,
-    api_key: str,
-    cx_id: str,
+    serpapi_key: str,
     extra_keyword: str = "",
 ) -> list[dict]:
     """
-    Google Custom Search API で関連企業を収集する。
+    SerpAPI（Google検索）で関連企業を収集する。
     展示会の出展企業だけでなく、セミナー・TKP開催企業も対象。
     """
-    service = build("customsearch", "v1", developerKey=api_key)
     companies: list[dict] = []
 
     queries = [
@@ -630,32 +653,24 @@ def _search_related_companies(
         queries.append(f'"{event_title}" {extra_keyword}')
 
     for query in queries[:4]:
-        try:
-            res = (
-                service.cse()
-                .list(q=query, cx=cx_id, num=MAX_SEARCH_RESULTS_PER_QUERY, lr="lang_ja")
-                .execute()
-            )
-            for item in res.get("items", []):
-                url = item.get("link", "")
-                parsed = urlparse(url)
-                companies.append({
-                    "name": item.get("title", ""),
-                    "url": url,
-                    "domain": parsed.netloc,
-                    "source": f"Google検索: {query[:25]}…",
-                })
-            time.sleep(0.3)
-        except Exception as exc:
-            st.warning(f"追加検索エラー: {exc}")
+        results = _serpapi_search(query, serpapi_key, MAX_SEARCH_RESULTS_PER_QUERY)
+        for item in results:
+            url = item.get("link", "")
+            parsed = urlparse(url)
+            companies.append({
+                "name": item.get("title", ""),
+                "url": url,
+                "domain": parsed.netloc,
+                "source": f"SerpAPI検索: {query[:25]}…",
+            })
+        time.sleep(0.3)
 
     return companies
 
 
 def collect_companies(
     event: dict,
-    api_key: str,
-    cx_id: str,
+    serpapi_key: str,
     extra_keyword: str = "",
 ) -> list[dict]:
     """
@@ -666,7 +681,7 @@ def collect_companies(
     raw: list[dict] = []
 
     raw.extend(_fetch_page_companies(event.get("url", "")))
-    raw.extend(_search_related_companies(event_name, api_key, cx_id, extra_keyword))
+    raw.extend(_search_related_companies(event_name, serpapi_key, extra_keyword))
 
     seen_domains: set[str] = set()
     deduped: list[dict] = []
@@ -956,17 +971,12 @@ def render_sidebar() -> dict:
     with st.sidebar:
         st.title("⚙️ 設定")
 
-        st.subheader("🔑 Google API")
-        google_api_key = st.text_input(
-            "Google API Key",
-            value=os.getenv("GOOGLE_API_KEY", ""),
+        st.subheader("🔑 SerpAPI（Google検索）")
+        serpapi_key = st.text_input(
+            "SerpAPI Key",
+            value=os.getenv("SERPAPI_KEY", ""),
             type="password",
-            help="Custom Search API を有効にして取得",
-        )
-        google_cx_id = st.text_input(
-            "Custom Search Engine ID (cx)",
-            value=os.getenv("GOOGLE_CX_ID", ""),
-            help="Programmable Search Engine コンソールで確認",
+            help="serpapi.com で無料登録して取得（無料枠: 月100回）",
         )
 
         st.subheader("🤖 Gemini API")
@@ -1020,8 +1030,7 @@ def render_sidebar() -> dict:
         ]
 
     return {
-        "google_api_key": google_api_key,
-        "google_cx_id": google_cx_id,
+        "serpapi_key": serpapi_key,
         "gemini_api_key": gemini_api_key,
         "gs_credentials": gs_credentials,
         "gs_spreadsheet": gs_spreadsheet,
@@ -1084,17 +1093,17 @@ def render_step1(cfg: dict) -> None:
             )
 
     if search_clicked:
-        if not cfg["google_api_key"] or not cfg["google_cx_id"]:
-            st.error("⚠️ Google API Key と Custom Search Engine ID を設定してください")
+        if not cfg["serpapi_key"]:
+            st.error("⚠️ SerpAPI Key を設定してください")
             return
         if not cfg["gemini_api_key"]:
             st.error("⚠️ Gemini API Key を設定してください（イベント整理に必要です）")
             return
 
-        # ステップA: Google検索
+        # ステップA: SerpAPI（Google検索）
         with st.spinner(f"🔍 Googleで「{selected_label}」関連イベントを検索中…"):
             candidates = auto_research_events(
-                genre, cfg["google_api_key"], cfg["google_cx_id"], cfg["max_queries"]
+                genre, cfg["serpapi_key"], cfg["max_queries"]
             )
 
         if not candidates:
@@ -1188,13 +1197,13 @@ def render_step2(cfg: dict) -> None:
     )
 
     if st.button("🏢 企業リストを収集する", type="primary", use_container_width=True):
-        if not cfg["google_api_key"] or not cfg["google_cx_id"]:
-            st.error("⚠️ API設定を確認してください")
+        if not cfg["serpapi_key"]:
+            st.error("⚠️ SerpAPI Key を設定してください")
             return
 
         with st.spinner("企業情報を収集中…（30秒〜1分程度かかる場合があります）"):
             raw_companies = collect_companies(
-                event, cfg["google_api_key"], cfg["google_cx_id"], extra_keyword
+                event, cfg["serpapi_key"], extra_keyword
             )
 
         valid, excluded = apply_exclusion_filter(raw_companies, cfg["additional_exclusions"])
