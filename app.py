@@ -760,78 +760,189 @@ def _scrape_company_page(url: str, max_chars: int = 2500) -> str:
         return ""
 
 
-def _search_related_companies(
+def _gather_search_results(
     event_title: str,
     serpapi_key: str,
     extra_keyword: str = "",
-    event_domain: str = "",
 ) -> list[dict]:
     """
-    SerpAPI（Google検索）で関連企業を収集する。
-    展示会の出展企業だけでなく、セミナー・TKP開催企業も対象。
-    案内ページ・一覧ページ・主催サイト自身のページは除外する。
+    SerpAPI（Google検索）で、出展企業・出展社一覧に関する検索結果を集める。
+    ここではタイトル・URL・スニペットをそのまま保持し（企業名抽出はGeminiが担当）、
+    後段のGemini抽出に渡す素材を多く集めることを優先する。
+
+    Returns:
+        list of {title, link, snippet, domain}
     """
-    companies: list[dict] = []
+    results_out: list[dict] = []
+    seen_urls: set[str] = set()
 
     queries = [
-        f'"{event_title}" 出展企業 OR 主催者 OR 運営会社',
-        f'"{event_title}" 出展社 OR 出展者一覧',
-        f'{event_title} セミナー OR 講演会 OR 自社開催 東京',
+        f'{event_title} 出展企業 一覧',
+        f'{event_title} 出展社一覧',
+        f'{event_title} 出展者 リスト',
         f'{event_title} スポンサー OR 協賛企業',
+        f'{event_title} 主催 OR 運営会社',
     ]
     if extra_keyword:
         queries.append(f'{event_title} {extra_keyword}')
 
-    for query in queries[:5]:
+    for query in queries[:6]:
         results = _serpapi_search(query, serpapi_key, MAX_SEARCH_RESULTS_PER_QUERY)
         for item in results:
             url = item.get("link", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
             parsed = urlparse(url)
-            name = item.get("title", "")
-            # 主催サイト自身のページ・SNS・案内/一覧ページは除外
-            if event_domain and parsed.netloc == event_domain:
-                continue
-            if _is_junk_company(name, parsed.netloc):
-                continue
-            if _is_junk_page_title(name, event_title):
-                continue
-            companies.append({
-                "name": name,
-                "url": url,
+            results_out.append({
+                "title": item.get("title", ""),
+                "link": url,
+                "snippet": item.get("snippet", ""),
                 "domain": parsed.netloc,
-                "source": f"SerpAPI検索: {query[:25]}…",
             })
         time.sleep(0.3)
 
-    return companies
+    return results_out
+
+
+def extract_companies_with_gemini(
+    event_name: str,
+    genre_label: str,
+    search_results: list[dict],
+    page_text: str,
+    gemini_api_key: str,
+) -> list[dict]:
+    """
+    検索結果のスニペットとイベントページ本文から、Geminiに
+    「実在する出展・協賛・主催企業名」だけを抽出させる。
+    ページタイトルをそのまま企業名にする方式の精度問題を解消する。
+
+    Returns:
+        list of {name, url, domain, source}
+    """
+    if not gemini_api_key:
+        return []
+
+    corpus_lines = []
+    for r in search_results[:40]:
+        corpus_lines.append(
+            f"- タイトル: {r.get('title', '')}\n"
+            f"  URL: {r.get('link', '')}\n"
+            f"  概要: {r.get('snippet', '')}"
+        )
+    corpus = "\n".join(corpus_lines) if corpus_lines else "（検索結果なし）"
+    page_excerpt = (page_text or "")[:3000]
+
+    prompt = f"""あなたは日本の展示会・イベントのリサーチ専門家です。
+イベント「{event_name}」（ジャンル: {genre_label}）に出展・協賛・主催している【実在の企業・法人】を、
+以下のイベントページ本文とWeb検索結果から可能な限り多く抽出してください。
+
+【イベントページ本文（抜粋）】
+{page_excerpt}
+
+【Web検索結果】
+{corpus}
+
+【抽出ルール】
+- 実在する企業・法人のみ（株式会社・有限会社・合同会社・Inc・Corp・Co.,Ltd・著名なブランド企業名など）
+- 「出展のご案内」「出展社一覧」「イベント情報」「事務局」「○○EXPO」などのページ名・イベント名そのものは企業ではないので除外
+- メディア記事・まとめサイト・比較サイトは企業として含めない
+- 同じ企業の重複は1つにまとめる
+- 公式サイトのURLが分かる場合のみ url に記載し、不明な場合は空文字 "" にする（推測のURLは書かない）
+- できるだけ多く（最大40社）挙げる
+
+【出力】JSON配列のみ（説明文は不要）:
+[
+  {{"name": "株式会社〇〇", "url": "https://example.co.jp"}},
+  {{"name": "△△工業株式会社", "url": ""}}
+]
+"""
+
+    try:
+        genai.configure(api_key=gemini_api_key)
+        model = genai.GenerativeModel(resolve_gemini_model())
+        response = model.generate_content(prompt)
+        parsed = _extract_json(response.text.strip())
+
+        out: list[dict] = []
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict) and item.get("name"):
+                    name = str(item["name"]).strip()
+                    url = str(item.get("url", "") or "").strip()
+                    domain = urlparse(url).netloc if url else ""
+                    if name and not _is_junk_page_title(name, event_name):
+                        out.append({
+                            "name": name,
+                            "url": url,
+                            "domain": domain,
+                            "source": "AI抽出",
+                        })
+        return out
+
+    except Exception as exc:
+        st.warning(f"企業名のAI抽出でエラー: {exc}")
+        return []
+
+
+def _normalize_company_name(name: str) -> str:
+    """重複判定用に企業名を正規化する（法人格・空白・記号を除去）。"""
+    cleaned = re.sub(
+        r"(株式会社|有限会社|合同会社|一般社団法人|公益財団法人|株|\(株\)|（株）|"
+        r"Co\.,?\s?Ltd\.?|Inc\.?|Corp\.?|Corporation|Company|Limited)",
+        "", name, flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[\s　・,.，。\-—|｜/]", "", cleaned)
+    return cleaned.lower()
 
 
 def collect_companies(
     event: dict,
     serpapi_key: str,
+    gemini_api_key: str = "",
+    genre_label: str = "不明",
     extra_keyword: str = "",
 ) -> list[dict]:
     """
-    イベントに関連する企業を収集し、ドメイン単位で重複除去して返す。
-    各企業に event_name を付与する。
+    イベントに関連する実在企業を収集して返す。
+    ① イベントページから直接出展リンクをスクレイピング
+    ② SerpAPIで検索 → Geminiが検索結果から実在企業名を抽出
+    企業名・ドメイン単位で重複除去し、各企業に event_name を付与する。
     """
     event_name = event.get("name", event.get("title", "不明"))
     event_url = event.get("url", "")
-    event_domain = urlparse(event_url).netloc
+
     raw: list[dict] = []
 
+    # ① イベントページ直接スクレイピング（実URLが取れる）
     raw.extend(_fetch_page_companies(event_url))
+
+    # ② 検索結果を集め、Geminiで実在企業名を抽出
+    search_results = _gather_search_results(event_name, serpapi_key, extra_keyword)
+    page_text = _scrape_company_page(event_url, max_chars=4000)
     raw.extend(
-        _search_related_companies(event_name, serpapi_key, extra_keyword, event_domain)
+        extract_companies_with_gemini(
+            event_name, genre_label, search_results, page_text, gemini_api_key
+        )
     )
 
+    seen_names: set[str] = set()
     seen_domains: set[str] = set()
     deduped: list[dict] = []
     for c in raw:
+        name = c.get("name", "")
+        name_key = _normalize_company_name(name)
         domain = c.get("domain", "")
-        if domain and domain not in seen_domains:
+        if not name_key:
+            continue
+        if name_key in seen_names:
+            continue
+        if domain and domain in seen_domains:
+            continue
+        seen_names.add(name_key)
+        if domain:
             seen_domains.add(domain)
-            deduped.append({**c, "event_name": event_name})
+        deduped.append({**c, "event_name": event_name})
 
     return deduped
 
@@ -1353,10 +1464,17 @@ def render_step2(cfg: dict) -> None:
         if not cfg["serpapi_key"]:
             st.error("⚠️ SerpAPI Key を設定してください")
             return
+        if not cfg["gemini_api_key"]:
+            st.error("⚠️ Gemini API Key を設定してください（企業名の抽出に必要です）")
+            return
 
         with st.spinner("企業情報を収集中…（30秒〜1分程度かかる場合があります）"):
             raw_companies = collect_companies(
-                event, cfg["serpapi_key"], extra_keyword
+                event,
+                cfg["serpapi_key"],
+                cfg["gemini_api_key"],
+                genre_label,
+                extra_keyword,
             )
 
         valid, excluded = apply_exclusion_filter(raw_companies, cfg["additional_exclusions"])
