@@ -39,7 +39,16 @@ EXCLUSION_KEYWORDS: list[str] = [
     "フェアリィ", "fairy1990",
 ]
 
-GEMINI_MODEL = "gemini-1.5-flash"
+# 利用したいGeminiモデルの優先順位（上から順に、使えるものを自動採用）
+GEMINI_MODEL_PREFERENCES = [
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+    "gemini-3.5-flash",
+    "gemini-2.0-flash",
+]
+
+# 解決済みモデル名のキャッシュ（毎回 list_models を呼ばないため）
+_RESOLVED_GEMINI_MODEL: "str | None" = None
 
 GS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -391,6 +400,46 @@ def _extract_json(text: str) -> "dict | list | None":
 
 
 # ============================================================
+# Geminiモデル名の自動解決
+# ============================================================
+
+def resolve_gemini_model() -> str:
+    """
+    APIキーで実際に generateContent が使えるモデルを検出して返す。
+    GEMINI_MODEL_PREFERENCES の優先順で採用し、無ければ flash 系→先頭を採用。
+    モデルが提供終了しても壊れないようにするための仕組み。
+    一度解決したらキャッシュする（事前に genai.configure 済みであること）。
+    """
+    global _RESOLVED_GEMINI_MODEL
+    if _RESOLVED_GEMINI_MODEL:
+        return _RESOLVED_GEMINI_MODEL
+
+    try:
+        available = [
+            m.name.replace("models/", "")
+            for m in genai.list_models()
+            if "generateContent" in getattr(m, "supported_generation_methods", [])
+        ]
+        for pref in GEMINI_MODEL_PREFERENCES:
+            if pref in available:
+                _RESOLVED_GEMINI_MODEL = pref
+                return pref
+        flash_models = [m for m in available if "flash" in m]
+        if flash_models:
+            _RESOLVED_GEMINI_MODEL = flash_models[0]
+            return flash_models[0]
+        if available:
+            _RESOLVED_GEMINI_MODEL = available[0]
+            return available[0]
+    except Exception:
+        pass
+
+    # 検出に失敗した場合のフォールバック
+    _RESOLVED_GEMINI_MODEL = GEMINI_MODEL_PREFERENCES[0]
+    return _RESOLVED_GEMINI_MODEL
+
+
+# ============================================================
 # 検索バックエンド: SerpAPI（Google検索結果を取得）
 # ============================================================
 
@@ -521,7 +570,7 @@ def validate_events_with_gemini(
 
     try:
         genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel(GEMINI_MODEL)
+        model = genai.GenerativeModel(resolve_gemini_model())
         response = model.generate_content(prompt)
         parsed = _extract_json(response.text.strip())
 
@@ -851,7 +900,7 @@ def run_ai_classification(
     各社のサイトをスクレイピング後に判定するためウェイトを必ず挟む。
     """
     genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    model = genai.GenerativeModel(resolve_gemini_model())
     results: list[dict] = []
     total = len(companies)
 
