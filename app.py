@@ -564,6 +564,43 @@ def auto_research_events(
     return candidates
 
 
+def _event_is_past(timing: str) -> bool:
+    """
+    開催時期の文字列から具体的な開催年月を読み取り、本日より明らかに過去なら True。
+    年が読み取れない・「毎年開催」・不明などは False（＝残す）。
+
+    例:
+      "2026年1月21日～22日" → （本日2026年6月なら）True（過去）
+      "2026年10月"         → False（未来）
+      "毎年10月" / "不明"   → False（判定不能なので残す）
+    """
+    if not timing:
+        return False
+
+    text = str(timing)
+    # 定期開催・通年・不明系は判定せず残す
+    for kw in ("毎年", "毎月", "毎回", "定期", "通年", "随時", "不明", "未定", "TBD"):
+        if kw in text:
+            return False
+
+    # 年を抽出（複数あれば最も新しい年で判定）
+    years = [int(y) for y in re.findall(r"(20\d{2})", text)]
+    if not years:
+        return False  # 年が不明 → 残す
+    year = max(years)
+
+    # 月を抽出（最初に出てくる「○月」）
+    month_match = re.search(r"(\d{1,2})\s*月", text)
+    month = int(month_match.group(1)) if month_match else 12
+
+    today = datetime.now()
+    if year < today.year:
+        return True
+    if year == today.year and month < today.month:
+        return True
+    return False
+
+
 def validate_events_with_gemini(
     candidates: list[dict],
     genre_label: str,
@@ -631,15 +668,18 @@ def validate_events_with_gemini(
         parsed = _extract_json(response.text.strip())
 
         if isinstance(parsed, list) and parsed:
-            # 必須キーが揃っているものだけ返す
+            # 必須キーが揃っており、かつ明らかに過去でないものだけ返す
             validated = []
             for item in parsed:
                 if isinstance(item, dict) and item.get("name") and item.get("url"):
+                    timing = item.get("timing", "不明")
+                    if _event_is_past(timing):
+                        continue  # 開催年月が本日より前 → 確実に除外
                     validated.append({
                         "name": item.get("name", "不明"),
                         "url": item.get("url", ""),
                         "venue": item.get("venue", "不明"),
-                        "timing": item.get("timing", "不明"),
+                        "timing": timing,
                         "format": item.get("format", "不明"),
                         "snippet": item.get("snippet", ""),
                     })
