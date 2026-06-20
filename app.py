@@ -62,6 +62,9 @@ GS_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+BACKUP_SHEET_TAB = "ツールバックアップ"
+SHEET_BACKUP_CHUNK_SIZE = 45000
+
 TOKYO_AREA_HINT = (
     "東京都各区（港区・渋谷区・新宿区・千代田区・中央区・品川区・豊島区・中野区・"
     "目黒区・世田谷区・江東区・台東区・墨田区・荒川区・足立区・葛飾区・江戸川区・"
@@ -450,6 +453,67 @@ def _gs_is_configured(cfg: dict) -> bool:
     return bool(cfg.get("gs_credentials") and cfg.get("gs_spreadsheet"))
 
 
+def _build_backup_payload() -> str:
+    """Drive/Sheetsバックアップ用のJSON文字列を生成する。"""
+    return json.dumps(
+        {k: st.session_state.get(k) for k in PERSIST_KEYS},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def backup_state_to_sheet(
+    credentials_json_str: str,
+    spreadsheet_ref: str,
+    sheet_name: str = BACKUP_SHEET_TAB,
+) -> "tuple[bool, str]":
+    """
+    作業状態JSONをスプレッドシートの専用タブに保存する。
+    個人Googleアカウントでもサービスアカウント経由で保存できる。
+    """
+    try:
+        creds_data = json.loads(credentials_json_str)
+    except json.JSONDecodeError:
+        return False, "サービスアカウントJSONの形式が正しくありません"
+
+    try:
+        payload = _build_backup_payload()
+        chunks = [
+            payload[i : i + SHEET_BACKUP_CHUNK_SIZE]
+            for i in range(0, len(payload), SHEET_BACKUP_CHUNK_SIZE)
+        ] or [""]
+
+        creds = Credentials.from_service_account_info(creds_data, scopes=GS_SCOPES)
+        client = gspread.authorize(creds)
+
+        match = re.search(r"/d/([a-zA-Z0-9_-]+)", spreadsheet_ref)
+        spreadsheet_id = match.group(1) if match else spreadsheet_ref.strip()
+        spreadsheet = client.open_by_key(spreadsheet_id)
+
+        try:
+            sheet = spreadsheet.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            sheet = spreadsheet.add_worksheet(
+                title=sheet_name,
+                rows=max(100, len(chunks) + 5),
+                cols=2,
+            )
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        rows = [
+            ["updated_at", now_str],
+            ["chunk_count", str(len(chunks))],
+        ]
+        rows.extend([f"chunk_{i}", chunk] for i, chunk in enumerate(chunks))
+
+        sheet.clear()
+        sheet.update(rows, value_input_option="RAW")
+
+        return True, f"スプレッドシート「{sheet_name}」タブにバックアップしました"
+    except Exception as exc:
+        return False, f"スプレッドシートバックアップエラー: {exc}"
+
+
 def backup_state_to_drive(credentials_json_str: str, folder_id: str) -> "tuple[bool, str]":
     """
     作業状態JSONをGoogleドライブの指定フォルダに保存する。
@@ -467,10 +531,7 @@ def backup_state_to_drive(credentials_json_str: str, folder_id: str) -> "tuple[b
     try:
         creds = Credentials.from_service_account_info(creds_data, scopes=GS_SCOPES)
         service = build("drive", "v3", credentials=creds)
-        payload = json.dumps(
-            {k: st.session_state.get(k) for k in PERSIST_KEYS},
-            ensure_ascii=False,
-        ).encode("utf-8")
+        payload = _build_backup_payload().encode("utf-8")
         media = MediaIoBaseUpload(
             io.BytesIO(payload), mimetype="application/json", resumable=False
         )
@@ -498,6 +559,13 @@ def backup_state_to_drive(credentials_json_str: str, folder_id: str) -> "tuple[b
             ).execute()
         return True, "Googleドライブにバックアップしました（oshigoto_latest.json）"
     except Exception as exc:
+        err = str(exc)
+        if "storageQuotaExceeded" in err or "storage quota" in err.lower():
+            return False, (
+                "個人GoogleアカウントではDrive保存できません。"
+                "Workspaceの共有ドライブが必要です。"
+                "代わりにスプレッドシートの「ツールバックアップ」タブをご利用ください。"
+            )
         return False, f"Driveバックアップエラー: {exc}"
 
 
@@ -1686,35 +1754,46 @@ def render_sidebar() -> dict:
             )
         if drive_ok:
             st.success("✅ Googleドライブバックアップ：設定済み")
+            st.caption(
+                "ℹ️ 個人GoogleアカウントではDrive保存は使えません。"
+                "Workspace共有ドライブのみ対応です。"
+            )
         else:
             st.caption("ℹ️ ドライブバックアップ：フォルダID未設定（任意）")
 
-        drive_status = st.session_state.get("_drive_backup_status")
-        if drive_status:
-            if drive_status.startswith("✅"):
-                st.caption(drive_status)
+        backup_status = st.session_state.get("_backup_status")
+        if backup_status:
+            if backup_status.startswith("✅"):
+                st.caption(backup_status)
             else:
-                st.warning(drive_status)
+                st.warning(backup_status)
 
         auto_sheet_export = st.checkbox(
             "STEP3完了時にスプレッドシートへ自動追記",
             value=True,
             help="ジャンルごとに別タブを作成し、絞り込み結果を末尾に追記します",
         )
+        auto_sheet_backup = st.checkbox(
+            "作業内容をスプレッドシートへ自動バックアップ",
+            value=True,
+            help=f"同じスプレッドシートの「{BACKUP_SHEET_TAB}」タブに作業状態を保存",
+        )
         auto_drive_backup = st.checkbox(
             "作業内容をGoogleドライブに自動バックアップ",
-            value=True,
-            help="フォルダID設定時、保存のたびに oshigoto_latest.json を更新",
+            value=False,
+            help="Workspace共有ドライブのみ。個人Googleアカウントでは失敗します",
         )
-        if drive_ok and st.button(
-            "☁️ 今すぐDriveにバックアップ",
+        if (sheets_ok or drive_ok) and st.button(
+            "☁️ 今すぐバックアップ",
             use_container_width=True,
-            help="自動バックアップが失敗したときの手動実行",
+            help="スプレッドシート（推奨）またはDriveへ手動バックアップ",
         ):
-            _maybe_backup_to_drive(
+            _maybe_auto_backup(
                 {
-                    "auto_drive_backup": True,
+                    "auto_sheet_backup": auto_sheet_backup,
+                    "auto_drive_backup": auto_drive_backup,
                     "gs_credentials": effective_gs_credentials,
+                    "gs_spreadsheet": effective_gs_spreadsheet,
                     "gs_drive_folder": effective_gs_drive_folder,
                 },
                 force=True,
@@ -1722,8 +1801,8 @@ def render_sidebar() -> dict:
             st.rerun()
 
         st.caption(
-            "📌 スプレッドシートのタブ名はジャンル名で自動作成されます"
-            "（例: 金融・フィンテック・資産運用）"
+            "📌 営業リストはジャンル名タブ、作業バックアップは"
+            f"「{BACKUP_SHEET_TAB}」タブに保存されます"
         )
 
         uploaded_csv = st.file_uploader(
@@ -1834,6 +1913,7 @@ def render_sidebar() -> dict:
         "gs_spreadsheet": effective_gs_spreadsheet,
         "gs_drive_folder": effective_gs_drive_folder,
         "auto_sheet_export": auto_sheet_export,
+        "auto_sheet_backup": auto_sheet_backup,
         "auto_drive_backup": auto_drive_backup,
         "delay_seconds": delay_seconds,
         "max_queries": max_queries,
@@ -2361,40 +2441,54 @@ def main() -> None:
         render_step4(cfg)
 
     save_state()
-    _maybe_backup_to_drive(cfg)
+    _maybe_auto_backup(cfg)
 
 
-def _maybe_backup_to_drive(cfg: dict, force: bool = False) -> None:
-    """内容が変わったときだけDriveへバックアップ（API節約）。"""
-    if not (
+def _maybe_auto_backup(cfg: dict, force: bool = False) -> None:
+    """内容が変わったときだけSheets/Driveへバックアップする。"""
+    sheet_enabled = cfg.get("auto_sheet_backup") and _gs_is_configured(cfg)
+    drive_enabled = (
         cfg.get("auto_drive_backup")
         and cfg.get("gs_credentials")
         and cfg.get("gs_drive_folder")
-    ):
+    )
+    if not sheet_enabled and not drive_enabled:
         return
     try:
-        payload = json.dumps(
-            {k: st.session_state.get(k) for k in PERSIST_KEYS},
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        payload = _build_backup_payload()
         content_hash = hash(payload)
-        if not force and st.session_state.get("_drive_backup_hash") == content_hash:
+        if not force and st.session_state.get("_backup_hash") == content_hash:
             return
-        ok, msg = backup_state_to_drive(
-            cfg["gs_credentials"], cfg["gs_drive_folder"]
-        )
-        if ok:
-            st.session_state["_drive_backup_hash"] = content_hash
-            st.session_state["_drive_backup_status"] = (
-                f"✅ Driveバックアップ成功: oshigoto_latest.json"
+
+        messages: list[str] = []
+        any_ok = False
+
+        if sheet_enabled:
+            ok, msg = backup_state_to_sheet(
+                cfg["gs_credentials"],
+                cfg["gs_spreadsheet"],
             )
-        else:
-            st.session_state["_drive_backup_status"] = f"⚠️ Driveバックアップ失敗: {msg}"
+            if ok:
+                any_ok = True
+                messages.append(f"✅ {msg}")
+            else:
+                messages.append(f"⚠️ {msg}")
+
+        if drive_enabled:
+            ok, msg = backup_state_to_drive(
+                cfg["gs_credentials"], cfg["gs_drive_folder"]
+            )
+            if ok:
+                any_ok = True
+                messages.append(f"✅ {msg}")
+            else:
+                messages.append(f"⚠️ {msg}")
+
+        if any_ok:
+            st.session_state["_backup_hash"] = content_hash
+        st.session_state["_backup_status"] = "\n".join(messages)
     except Exception as exc:
-        st.session_state["_drive_backup_status"] = (
-            f"⚠️ Driveバックアップ失敗: {exc}"
-        )
+        st.session_state["_backup_status"] = f"⚠️ バックアップ失敗: {exc}"
 
 
 if __name__ == "__main__":
