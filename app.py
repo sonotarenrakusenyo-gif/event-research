@@ -1504,6 +1504,44 @@ def render_sidebar() -> dict:
             if line.strip()
         ]
 
+        st.subheader("💾 バックアップ（再デプロイ対策）")
+        st.caption(
+            "アプリを更新（再デプロイ）すると保存結果は初期化されます。"
+            "下のボタンで作業内容をファイルに保存し、更新後にアップロードで"
+            "復元できます（復元はAPIを消費しません）。"
+        )
+        backup_payload = json.dumps(
+            {k: st.session_state.get(k) for k in PERSIST_KEYS},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        backup_name = (
+            f"oshigoto_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+        )
+        st.download_button(
+            "💾 作業内容をダウンロード保存",
+            data=backup_payload,
+            file_name=backup_name,
+            mime="application/json",
+            use_container_width=True,
+        )
+        uploaded_backup = st.file_uploader(
+            "📂 バックアップから復元（jsonをアップロード）",
+            type=["json"],
+            key="backup_uploader",
+        )
+        if uploaded_backup is not None:
+            if st.button("📂 このバックアップで復元する", use_container_width=True):
+                try:
+                    data = json.load(uploaded_backup)
+                    for key, val in data.items():
+                        if key in PERSIST_KEYS and val is not None:
+                            st.session_state[key] = val
+                    save_state()
+                    st.success("バックアップから復元しました。")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"復元に失敗しました: {exc}")
+
         st.subheader("🗑️ データのリセット")
         st.caption(
             "リロードしても結果は保持されます。"
