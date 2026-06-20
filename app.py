@@ -1300,7 +1300,18 @@ def classify_company(
 
     except Exception as exc:
         fallback["event_details"] = f"APIエラー: {exc}"
+        fallback["_api_error"] = str(exc)
         return {**company, **fallback}
+
+
+def _company_key(c: dict) -> tuple:
+    """判定済み判定用の企業キー（正規化名＋URL）。"""
+    return (_normalize_company_name(c.get("name", "")), c.get("url", ""))
+
+
+def _is_quota_error(msg: str) -> bool:
+    m = str(msg).lower()
+    return "429" in m or "quota" in m or "exceeded" in m or "rate limit" in m
 
 
 def run_ai_classification(
@@ -1310,29 +1321,54 @@ def run_ai_classification(
     genre_label: str,
     progress_bar,
     status_text,
-) -> list[dict]:
+) -> "tuple[list[dict], bool]":
     """
-    企業リスト全体を順番にGemini判定する。
-    各社のサイトをスクレイピング後に判定するためウェイトを必ず挟む。
+    企業リストを順番にGemini判定する。
+    - 判定済みの社（st.session_state.ai_results）はスキップして「途中から再開」
+    - 1社ごとに結果を保存（中断しても進捗が残る）
+    - 無料枠（1日上限）を使い切ったら、その時点で安全に中断する
+
+    Returns:
+        (これまでの全判定結果, 無料枠切れで中断したか)
     """
     genai.configure(api_key=gemini_api_key)
     model = genai.GenerativeModel(resolve_gemini_model())
-    results: list[dict] = []
+
+    results: list[dict] = list(st.session_state.get("ai_results", []) or [])
+    done_keys = {_company_key(c) for c in results}
     total = len(companies)
+    quota_stopped = False
 
     for i, company in enumerate(companies):
+        if _company_key(company) in done_keys:
+            progress_bar.progress((i + 1) / total)
+            continue
+
         status_text.markdown(
             f"**判定中 ({i + 1} / {total}):** {company.get('name', '不明')}　"
             f"（サイト取得 → Gemini判定 → {delay_seconds}秒待機）"
         )
         result = classify_company(company, model, genre_label)
+
+        # 無料枠切れ（クォータ）なら、そのコは保存せず安全に中断
+        api_err = result.get("_api_error", "")
+        if api_err and _is_quota_error(api_err):
+            quota_stopped = True
+            break
+
+        result.pop("_api_error", None)
         results.append(result)
+        done_keys.add(_company_key(company))
+
+        # 逐次保存（途中で止まっても再開できるように）
+        st.session_state.ai_results = results
+        save_state()
         progress_bar.progress((i + 1) / total)
 
         if i < total - 1:
             time.sleep(delay_seconds)
 
-    return results
+    return results, quota_stopped
 
 
 # ============================================================
@@ -1809,20 +1845,37 @@ def render_step3(cfg: dict) -> None:
         return
 
     total = len(st.session_state.companies)
-    estimated_sec = total * (cfg["delay_seconds"] + 3)
     genre_label = st.session_state.get("selected_genre_label", "不明")
 
+    # 既に判定済みの社数（中断後の再開に対応）
+    company_keys = {_company_key(c) for c in st.session_state.companies}
+    done_results = [
+        c for c in (st.session_state.get("ai_results") or [])
+        if _company_key(c) in company_keys
+    ]
+    done_count = len(done_results)
+    remaining = total - done_count
+    estimated_sec = remaining * (cfg["delay_seconds"] + 3)
+
     st.info(
-        f"**{total} 社**を対象に以下を一括判定します。\n\n"
+        f"**{total} 社**を対象に以下を判定します"
+        f"（判定済み {done_count} 社 / 残り {remaining} 社）。\n\n"
         f"① 東京都内・近郊エリアの企業かどうか\n"
         f"② MC・ナレーターを必要とするイベント開催実績があるか\n"
         f"③ エル・アミティエ / フェアリィと深い関係がある企業でないか\n"
         f"④ 13項目の営業情報を同時抽出\n\n"
-        f"⏱️ 予想所要時間: 約 **{estimated_sec // 60} 分 {estimated_sec % 60} 秒**"
-        f"（{cfg['delay_seconds']} 秒間隔）"
+        f"⏱️ 残りの予想所要時間: 約 **{estimated_sec // 60} 分 {estimated_sec % 60} 秒**"
+        f"（{cfg['delay_seconds']} 秒間隔）\n\n"
+        f"💡 途中で止まっても、もう一度ボタンを押せば**続きから再開**します"
+        f"（判定済みの社は再消費しません）。"
     )
 
-    if st.button("🤖 AI判定を開始する", type="primary", use_container_width=True):
+    btn_label = (
+        "🤖 AI判定を開始する" if done_count == 0
+        else f"▶️ 続きからAI判定を再開する（残り {remaining} 社）"
+    )
+
+    if remaining > 0 and st.button(btn_label, type="primary", use_container_width=True):
         if not cfg["gemini_api_key"]:
             st.error("⚠️ Gemini API Key を設定してください")
             return
@@ -1830,7 +1883,7 @@ def render_step3(cfg: dict) -> None:
         progress_bar = st.progress(0)
         status_text = st.empty()
 
-        ai_results = run_ai_classification(
+        ai_results, quota_stopped = run_ai_classification(
             st.session_state.companies,
             cfg["gemini_api_key"],
             cfg["delay_seconds"],
@@ -1853,20 +1906,35 @@ def render_step3(cfg: dict) -> None:
 
         st.session_state.ai_results = ai_results
         st.session_state.filtered_companies = filtered
+        save_state()
 
-        status_text.markdown("✅ **判定完了！**")
+        judged = len(ai_results)
         progress_bar.progress(1.0)
+
+        if quota_stopped:
+            status_text.markdown("⏸️ **無料枠の上限で一時停止しました**")
+            st.warning(
+                f"本日のGemini無料枠を使い切った可能性があります。"
+                f"**ここまで {judged} 社ぶんは保存済み**です。\n\n"
+                f"時間をおいて（枠リセット後に）もう一度ボタンを押すと、"
+                f"**残り {total - judged} 社を続きから判定**します。"
+            )
+        else:
+            status_text.markdown("✅ **判定完了！**")
 
         tokyo_ok = sum(1 for c in ai_results if c.get("tokyo_area"))
         mc_ok = sum(1 for c in ai_results if c.get("mc_related"))
         excl = sum(1 for c in ai_results if c.get("exclusion_risk"))
         st.success(
-            f"✅ {total} 社を判定しました。\n\n"
+            f"✅ {judged} 社を判定しました。\n\n"
             f"- 東京エリア該当: {tokyo_ok} 社\n"
             f"- MC・ナレーター需要あり: {mc_ok} 社\n"
             f"- 除外リスクあり（除外済み）: {excl} 社\n"
             f"- **最終残存: {len(filtered)} 社**"
         )
+
+    elif remaining == 0 and total > 0:
+        st.success(f"✅ 全 {total} 社の判定が完了しています。")
 
     # ---- AI判定全件 ----
     if st.session_state.ai_results:
