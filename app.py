@@ -49,8 +49,9 @@ GEMINI_MODEL_PREFERENCES = [
     "gemini-2.0-flash",
 ]
 
-# 解決済みモデル名のキャッシュ（毎回 list_models を呼ばないため）
+# 解決済みモデル名・モデルチェーンのキャッシュ（毎回 list_models を呼ばないため）
 _RESOLVED_GEMINI_MODEL: "str | None" = None
+_RESOLVED_GEMINI_CHAIN: "list[str] | None" = None
 
 GS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -405,51 +406,70 @@ def _extract_json(text: str) -> "dict | list | None":
 # Geminiモデル名の自動解決
 # ============================================================
 
-def resolve_gemini_model() -> str:
+def resolve_gemini_model_chain() -> list[str]:
     """
-    APIキーで実際に generateContent が使えるモデルを検出して返す。
-    GEMINI_MODEL_PREFERENCES の優先順で採用し、無ければ flash 系→先頭を採用。
-    モデルが提供終了しても壊れないようにするための仕組み。
+    APIキーで実際に generateContent が使えるモデルを、優先順に並べた
+    リスト（チェーン）として返す。あるモデルが1日の無料枠を使い切った
+    場合に次のモデルへ自動で切り替えるために使う。
     一度解決したらキャッシュする（事前に genai.configure 済みであること）。
     """
-    global _RESOLVED_GEMINI_MODEL
-    if _RESOLVED_GEMINI_MODEL:
-        return _RESOLVED_GEMINI_MODEL
+    global _RESOLVED_GEMINI_CHAIN
+    if _RESOLVED_GEMINI_CHAIN:
+        return _RESOLVED_GEMINI_CHAIN
 
+    chain: list[str] = []
     try:
         available = [
             m.name.replace("models/", "")
             for m in genai.list_models()
             if "generateContent" in getattr(m, "supported_generation_methods", [])
         ]
+        # 優先リストのうち利用可能なものを順に追加
         for pref in GEMINI_MODEL_PREFERENCES:
-            if pref in available:
-                _RESOLVED_GEMINI_MODEL = pref
-                return pref
-        flash_models = [m for m in available if "flash" in m]
-        if flash_models:
-            _RESOLVED_GEMINI_MODEL = flash_models[0]
-            return flash_models[0]
-        if available:
-            _RESOLVED_GEMINI_MODEL = available[0]
-            return available[0]
+            if pref in available and pref not in chain:
+                chain.append(pref)
+        # 優先リスト外でも flash 系があれば後ろに追加（保険）
+        for m in available:
+            if "flash" in m and m not in chain:
+                chain.append(m)
+        # それでも空なら利用可能な先頭数件
+        if not chain and available:
+            chain = available[:3]
     except Exception:
         pass
 
-    # 検出に失敗した場合のフォールバック
-    _RESOLVED_GEMINI_MODEL = GEMINI_MODEL_PREFERENCES[0]
+    if not chain:
+        chain = list(GEMINI_MODEL_PREFERENCES)
+
+    _RESOLVED_GEMINI_CHAIN = chain
+    return chain
+
+
+def resolve_gemini_model() -> str:
+    """利用可能なGeminiモデルの先頭（最優先）を返す。"""
+    global _RESOLVED_GEMINI_MODEL
+    if _RESOLVED_GEMINI_MODEL:
+        return _RESOLVED_GEMINI_MODEL
+    _RESOLVED_GEMINI_MODEL = resolve_gemini_model_chain()[0]
     return _RESOLVED_GEMINI_MODEL
 
 
-def gemini_generate(model: "genai.GenerativeModel", prompt: str, max_retries: int = 4):
+def gemini_generate(model: "genai.GenerativeModel", prompt: str, max_retries: int = 5):
     """
-    Geminiを呼び出す。429（無料枠のレート超過）が出たら、指定された
-    retry_delay 秒だけ待ってから自動的に再試行する。
+    Geminiを呼び出す。429（無料枠の超過）が出たら以下を行う:
+    - 1分あたりの上限（PerMinute）→ retry_delay 秒だけ待って再試行
+    - 1日あたりの上限（PerDay）→ 別モデルへ自動で切り替えて再試行
+      （各モデルは別々の1日枠を持つため）
     """
+    chain = resolve_gemini_model_chain()
+    current_name = str(getattr(model, "model_name", "") or "").replace("models/", "")
+    current_model = model
+    tried: set[str] = {current_name} if current_name else set()
     last_exc: "Exception | None" = None
+
     for attempt in range(max_retries):
         try:
-            return model.generate_content(prompt)
+            return current_model.generate_content(prompt)
         except Exception as exc:
             last_exc = exc
             msg = str(exc)
@@ -459,8 +479,20 @@ def gemini_generate(model: "genai.GenerativeModel", prompt: str, max_retries: in
                 or "rate limit" in msg.lower()
                 or "exceeded" in msg.lower()
             )
-            if is_rate_limit and attempt < max_retries - 1:
-                # retry_delay 秒を抽出（なければ指数的に待つ）
+            if not is_rate_limit:
+                raise
+
+            is_daily = ("perday" in msg.lower()) or ("per day" in msg.lower())
+
+            # 1日上限なら、まだ試していない別モデルへ切り替える
+            if is_daily:
+                next_model = next((m for m in chain if m not in tried), None)
+                if next_model:
+                    tried.add(next_model)
+                    current_model = genai.GenerativeModel(next_model)
+                    continue
+
+            if attempt < max_retries - 1:
                 match = (
                     re.search(r"retry_delay\D*(\d+)", msg)
                     or re.search(r"retry in (\d+)", msg)
