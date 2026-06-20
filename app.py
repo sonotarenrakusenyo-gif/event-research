@@ -14,10 +14,13 @@ from bs4 import BeautifulSoup
 import google.generativeai as genai
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 import pandas as pd
 import time
 import json
 import re
+import io
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
 import os
@@ -364,7 +367,8 @@ PERSIST_KEYS = [
     "collect_stats",
 ]
 
-# 保存先（サーバー上の一時領域。リロードでは消えず、再デプロイ時のみ初期化）
+# 保存先（サーバー上の一時領域。同一サーバー稼働中のリロードでは残るが、
+# Streamlit Cloudのスリープ・再起動・再デプロイでは消える）
 STATE_FILE = os.path.join(tempfile.gettempdir(), "oshigoto_tool_state.json")
 
 
@@ -402,6 +406,106 @@ def clear_saved_state() -> None:
     for key in PERSIST_KEYS:
         if key in st.session_state:
             del st.session_state[key]
+
+
+def _genre_to_sheet_tab(genre_label: str) -> str:
+    """ジャンル名からスプレッドシートのタブ名を生成する（禁止文字を除去）。"""
+    name = re.sub(r"^\d+\.\s*", "", (genre_label or "営業リスト").strip())
+    name = re.sub(r"[\[\]\\/?*]", "", name).strip()
+    return (name[:100] if name else "営業リスト")
+
+
+def _gs_is_configured(cfg: dict) -> bool:
+    """Googleスプレッドシート連携に必要な設定が揃っているか。"""
+    return bool(cfg.get("gs_credentials") and cfg.get("gs_spreadsheet"))
+
+
+def backup_state_to_drive(credentials_json_str: str, folder_id: str) -> "tuple[bool, str]":
+    """
+    作業状態JSONをGoogleドライブの指定フォルダに保存する。
+    同名ファイル oshigoto_latest.json があれば上書き、なければ新規作成。
+    """
+    try:
+        creds_data = json.loads(credentials_json_str)
+    except json.JSONDecodeError:
+        return False, "サービスアカウントJSONの形式が正しくありません"
+
+    try:
+        creds = Credentials.from_service_account_info(creds_data, scopes=GS_SCOPES)
+        service = build("drive", "v3", credentials=creds)
+        payload = json.dumps(
+            {k: st.session_state.get(k) for k in PERSIST_KEYS},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        media = MediaIoBaseUpload(
+            io.BytesIO(payload), mimetype="application/json", resumable=False
+        )
+
+        query = (
+            f"name='oshigoto_latest.json' and '{folder_id}' in parents "
+            f"and trashed=false"
+        )
+        existing = (
+            service.files()
+            .list(q=query, fields="files(id)", supportsAllDrives=True)
+            .execute()
+            .get("files", [])
+        )
+        if existing:
+            service.files().update(
+                fileId=existing[0]["id"], media_body=media, supportsAllDrives=True
+            ).execute()
+        else:
+            service.files().create(
+                body={"name": "oshigoto_latest.json", "parents": [folder_id]},
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+        return True, "Googleドライブにバックアップしました（oshigoto_latest.json）"
+    except Exception as exc:
+        return False, f"Driveバックアップエラー: {exc}"
+
+
+def _csv_row_to_company(row: pd.Series) -> dict:
+    """CSVの1行を filtered_companies 用の dict に変換する。"""
+    return {
+        "genre_label": row.get("イベントジャンル（50選）", "不明"),
+        "event_name": row.get("AIが自動リサーチしたイベント名", "不明"),
+        "name": row.get("企業名", ""),
+        "url": row.get("企業のHP URL", ""),
+        "contact": row.get("連絡先（代表メールや問い合わせ窓口）", "不明"),
+        "contact_title": row.get("担当者肩書", "不明"),
+        "contact_name": row.get("担当者名", "不明"),
+        "event_timing": row.get("イベント開催時期", "不明"),
+        "event_venue": row.get("開催会場", "不明"),
+        "event_format": row.get("イベント形式", "不明"),
+        "event_details": row.get("ジャンルや特徴・詳細", "不明"),
+        "mc_job": row.get("ステージの種類・MC業務内容", "不明"),
+        "mc_scene": row.get("MCの想定シーン", "不明"),
+        "source": row.get("情報ソース", ""),
+    }
+
+
+def import_companies_from_csv(uploaded_file) -> "tuple[bool, str]":
+    """営業リストCSVから filtered_companies を復元する。"""
+    try:
+        df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+        if df.empty or "企業名" not in df.columns:
+            return False, "CSVの形式が正しくありません（企業名列が必要です）"
+        companies = [_csv_row_to_company(row) for _, row in df.iterrows()]
+        companies = [c for c in companies if c.get("name")]
+        if not companies:
+            return False, "有効な企業データがありません"
+        st.session_state.filtered_companies = companies
+        st.session_state.ai_results = companies
+        genre = companies[0].get("genre_label", "不明")
+        if genre and genre != "不明":
+            st.session_state.selected_genre_label = genre
+        save_state()
+        return True, f"{len(companies)} 社を復元しました（STEP4から利用可能）"
+    except Exception as exc:
+        return False, f"CSV復元エラー: {exc}"
 
 
 def init_session_state() -> None:
@@ -1464,6 +1568,27 @@ def export_to_google_sheets(
         return False, f"スプレッドシートエラー: {exc}"
 
 
+def auto_export_if_configured(
+    companies: list[dict],
+    cfg: dict,
+    genre_label: str,
+) -> "tuple[bool, str]":
+    """設定が揃っていればジャンル別タブへ自動追記する。"""
+    if not cfg.get("auto_sheet_export"):
+        return False, "自動追記はオフです"
+    if not _gs_is_configured(cfg):
+        return False, "スプレッドシート連携が未設定です"
+    if not companies:
+        return False, "追記する企業がありません"
+    sheet_tab = _genre_to_sheet_tab(genre_label)
+    return export_to_google_sheets(
+        companies,
+        cfg["gs_spreadsheet"],
+        cfg["gs_credentials"],
+        sheet_tab,
+    )
+
+
 # ============================================================
 # サイドバー
 # ============================================================
@@ -1488,19 +1613,70 @@ def render_sidebar() -> dict:
             help="Google AI Studio（aistudio.google.com）で無料取得",
         )
 
-        st.subheader("📊 Googleスプレッドシート")
+        st.subheader("📊 Google連携（スプレッドシート / ドライブ）")
         gs_credentials = st.text_area(
             "サービスアカウント JSON",
             value=os.getenv("GS_CREDENTIALS_JSON", ""),
             height=90,
-            help="JSONキーファイルの内容をそのまま貼り付け",
+            help="JSONキーファイルの内容をそのまま貼り付け（Secrets推奨）",
             placeholder='{"type":"service_account","project_id":"..."}',
         )
         gs_spreadsheet = st.text_input(
             "スプレッドシート URL または ID",
             value=os.getenv("GS_SPREADSHEET_ID", ""),
+            help="追記先のスプレッドシート。サービスアカウントを「編集者」で共有してください",
         )
-        gs_sheet_name = st.text_input("シート名", value="営業リスト")
+        gs_drive_folder = st.text_input(
+            "Googleドライブ バックアップフォルダ ID",
+            value=os.getenv("GS_DRIVE_FOLDER_ID", ""),
+            help="Drive上のフォルダをサービスアカウントと共有し、フォルダIDを入力",
+        )
+
+        # 接続状態の表示（Secrets/入力が揃っているか）
+        sheets_ok = bool(gs_credentials and gs_spreadsheet)
+        drive_ok = bool(gs_credentials and gs_drive_folder)
+        if sheets_ok:
+            st.success("✅ スプレッドシート連携：設定済み（ジャンル別タブに追記可能）")
+        else:
+            st.warning(
+                "⚠️ スプレッドシート連携：未設定\n"
+                "（サービスアカウントJSON ＋ スプレッドシートURL/ID が必要）"
+            )
+        if drive_ok:
+            st.success("✅ Googleドライブバックアップ：設定済み")
+        else:
+            st.caption("ℹ️ ドライブバックアップ：フォルダID未設定（任意）")
+
+        auto_sheet_export = st.checkbox(
+            "STEP3完了時にスプレッドシートへ自動追記",
+            value=True,
+            help="ジャンルごとに別タブを作成し、絞り込み結果を末尾に追記します",
+        )
+        auto_drive_backup = st.checkbox(
+            "作業内容をGoogleドライブに自動バックアップ",
+            value=True,
+            help="フォルダID設定時、保存のたびに oshigoto_latest.json を更新",
+        )
+
+        st.caption(
+            "📌 スプレッドシートのタブ名はジャンル名で自動作成されます"
+            "（例: 金融・フィンテック・資産運用）"
+        )
+
+        uploaded_csv = st.file_uploader(
+            "📂 営業リストCSVから復元",
+            type=["csv"],
+            key="csv_restore_uploader",
+            help="STEP4でダウンロードしたCSVをアップロードすると企業リストを復元",
+        )
+        if uploaded_csv is not None:
+            if st.button("📂 このCSVで企業リストを復元", use_container_width=True):
+                ok, msg = import_companies_from_csv(uploaded_csv)
+                if ok:
+                    st.success(f"✅ {msg}")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {msg}")
 
         st.subheader("⏱️ レートリミット設定")
         delay_seconds = st.slider(
@@ -1593,7 +1769,9 @@ def render_sidebar() -> dict:
         "gemini_api_key": gemini_api_key,
         "gs_credentials": gs_credentials,
         "gs_spreadsheet": gs_spreadsheet,
-        "gs_sheet_name": gs_sheet_name,
+        "gs_drive_folder": gs_drive_folder,
+        "auto_sheet_export": auto_sheet_export,
+        "auto_drive_backup": auto_drive_backup,
         "delay_seconds": delay_seconds,
         "max_queries": max_queries,
         "target_years": target_years,
@@ -1921,6 +2099,17 @@ def render_step3(cfg: dict) -> None:
             )
         else:
             status_text.markdown("✅ **判定完了！**")
+            if filtered:
+                sheet_ok, sheet_msg = auto_export_if_configured(
+                    filtered, cfg, genre_label
+                )
+                if sheet_ok:
+                    st.info(f"📊 {sheet_msg}")
+                elif cfg.get("auto_sheet_export") and not _gs_is_configured(cfg):
+                    st.caption(
+                        "ℹ️ スプレッドシート自動追記：連携未設定のためスキップしました。"
+                        "サイドバーでサービスアカウントJSONとスプレッドシートIDを設定してください。"
+                    )
 
         tokyo_ok = sum(1 for c in ai_results if c.get("tokyo_area"))
         mc_ok = sum(1 for c in ai_results if c.get("mc_related"))
@@ -2037,7 +2226,12 @@ def render_step4(cfg: dict) -> None:
     st.divider()
 
     # ---- スプレッドシート直接書き込み ----
-    st.subheader("📊 Googleスプレッドシートへ直接書き込み（任意）")
+    st.subheader("📊 Googleスプレッドシートへ直接書き込み（手動）")
+    genre_label = st.session_state.get("selected_genre_label", "不明")
+    sheet_tab = _genre_to_sheet_tab(genre_label)
+    st.caption(
+        f"追記先タブ: **{sheet_tab}**（ジャンルごとに自動でタブを分けます）"
+    )
     st.caption("サービスアカウントJSONを設定している場合のみ利用可能")
 
     if st.button("📤 スプレッドシートに書き込む", use_container_width=True):
@@ -2051,7 +2245,7 @@ def render_step4(cfg: dict) -> None:
                     companies,
                     cfg["gs_spreadsheet"],
                     cfg["gs_credentials"],
-                    cfg["gs_sheet_name"],
+                    sheet_tab,
                 )
             if success:
                 st.success(f"✅ {message}")
@@ -2103,8 +2297,34 @@ def main() -> None:
     with tab4:
         render_step4(cfg)
 
-    # 取得結果を保存（次回リロード時に復元され、API枠の無駄遣いを防ぐ）
     save_state()
+    _maybe_backup_to_drive(cfg)
+
+
+def _maybe_backup_to_drive(cfg: dict) -> None:
+    """内容が変わったときだけDriveへバックアップ（API節約）。"""
+    if not (
+        cfg.get("auto_drive_backup")
+        and cfg.get("gs_credentials")
+        and cfg.get("gs_drive_folder")
+    ):
+        return
+    try:
+        payload = json.dumps(
+            {k: st.session_state.get(k) for k in PERSIST_KEYS},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        content_hash = hash(payload)
+        if st.session_state.get("_drive_backup_hash") == content_hash:
+            return
+        ok, _msg = backup_state_to_drive(
+            cfg["gs_credentials"], cfg["gs_drive_folder"]
+        )
+        if ok:
+            st.session_state["_drive_backup_hash"] = content_hash
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
