@@ -415,6 +415,36 @@ def _genre_to_sheet_tab(genre_label: str) -> str:
     return (name[:100] if name else "営業リスト")
 
 
+def _get_secret(key: str, default: str = "") -> str:
+    """Streamlit Secrets → 環境変数 → デフォルトの順で設定値を取得する。"""
+    try:
+        if key in st.secrets:
+            val = st.secrets[key]
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    except Exception:
+        pass
+    return os.getenv(key, default).strip()
+
+
+def _normalize_drive_folder_id(folder_ref: str) -> str:
+    """DriveフォルダURLまたはIDからフォルダID部分だけを取り出す。"""
+    ref = (folder_ref or "").strip()
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", ref)
+    return match.group(1) if match else ref
+
+
+def _effective_gs_credentials(widget_value: str) -> str:
+    """
+    サービスアカウントJSONを取得する。
+    Streamlit CloudではSecretsの値を優先（サイドバーの短文表示欄は長いJSONが欠けることがある）。
+    """
+    secret_val = _get_secret("GS_CREDENTIALS_JSON")
+    if secret_val:
+        return secret_val
+    return (widget_value or "").strip()
+
+
 def _gs_is_configured(cfg: dict) -> bool:
     """Googleスプレッドシート連携に必要な設定が揃っているか。"""
     return bool(cfg.get("gs_credentials") and cfg.get("gs_spreadsheet"))
@@ -429,6 +459,10 @@ def backup_state_to_drive(credentials_json_str: str, folder_id: str) -> "tuple[b
         creds_data = json.loads(credentials_json_str)
     except json.JSONDecodeError:
         return False, "サービスアカウントJSONの形式が正しくありません"
+
+    folder_id = _normalize_drive_folder_id(folder_id)
+    if not folder_id:
+        return False, "DriveフォルダIDが空です"
 
     try:
         creds = Credentials.from_service_account_info(creds_data, scopes=GS_SCOPES)
@@ -1600,7 +1634,7 @@ def render_sidebar() -> dict:
         st.subheader("🔑 SerpAPI（Google検索）")
         serpapi_key = st.text_input(
             "SerpAPI Key",
-            value=os.getenv("SERPAPI_KEY", ""),
+            value=_get_secret("SERPAPI_KEY"),
             type="password",
             help="serpapi.com で無料登録して取得（無料枠: 月100回）",
         )
@@ -1608,7 +1642,7 @@ def render_sidebar() -> dict:
         st.subheader("🤖 Gemini API")
         gemini_api_key = st.text_input(
             "Gemini API Key",
-            value=os.getenv("GEMINI_API_KEY", ""),
+            value=_get_secret("GEMINI_API_KEY"),
             type="password",
             help="Google AI Studio（aistudio.google.com）で無料取得",
         )
@@ -1616,25 +1650,33 @@ def render_sidebar() -> dict:
         st.subheader("📊 Google連携（スプレッドシート / ドライブ）")
         gs_credentials = st.text_area(
             "サービスアカウント JSON",
-            value=os.getenv("GS_CREDENTIALS_JSON", ""),
+            value=_get_secret("GS_CREDENTIALS_JSON"),
             height=90,
             help="JSONキーファイルの内容をそのまま貼り付け（Secrets推奨）",
             placeholder='{"type":"service_account","project_id":"..."}',
         )
         gs_spreadsheet = st.text_input(
             "スプレッドシート URL または ID",
-            value=os.getenv("GS_SPREADSHEET_ID", ""),
+            value=_get_secret("GS_SPREADSHEET_ID"),
             help="追記先のスプレッドシート。サービスアカウントを「編集者」で共有してください",
         )
         gs_drive_folder = st.text_input(
             "Googleドライブ バックアップフォルダ ID",
-            value=os.getenv("GS_DRIVE_FOLDER_ID", ""),
+            value=_get_secret("GS_DRIVE_FOLDER_ID"),
             help="Drive上のフォルダをサービスアカウントと共有し、フォルダIDを入力",
         )
 
+        effective_gs_credentials = _effective_gs_credentials(gs_credentials)
+        effective_gs_spreadsheet = (gs_spreadsheet or "").strip() or _get_secret(
+            "GS_SPREADSHEET_ID"
+        )
+        effective_gs_drive_folder = _normalize_drive_folder_id(
+            (gs_drive_folder or "").strip() or _get_secret("GS_DRIVE_FOLDER_ID")
+        )
+
         # 接続状態の表示（Secrets/入力が揃っているか）
-        sheets_ok = bool(gs_credentials and gs_spreadsheet)
-        drive_ok = bool(gs_credentials and gs_drive_folder)
+        sheets_ok = bool(effective_gs_credentials and effective_gs_spreadsheet)
+        drive_ok = bool(effective_gs_credentials and effective_gs_drive_folder)
         if sheets_ok:
             st.success("✅ スプレッドシート連携：設定済み（ジャンル別タブに追記可能）")
         else:
@@ -1647,6 +1689,13 @@ def render_sidebar() -> dict:
         else:
             st.caption("ℹ️ ドライブバックアップ：フォルダID未設定（任意）")
 
+        drive_status = st.session_state.get("_drive_backup_status")
+        if drive_status:
+            if drive_status.startswith("✅"):
+                st.caption(drive_status)
+            else:
+                st.warning(drive_status)
+
         auto_sheet_export = st.checkbox(
             "STEP3完了時にスプレッドシートへ自動追記",
             value=True,
@@ -1657,6 +1706,20 @@ def render_sidebar() -> dict:
             value=True,
             help="フォルダID設定時、保存のたびに oshigoto_latest.json を更新",
         )
+        if drive_ok and st.button(
+            "☁️ 今すぐDriveにバックアップ",
+            use_container_width=True,
+            help="自動バックアップが失敗したときの手動実行",
+        ):
+            _maybe_backup_to_drive(
+                {
+                    "auto_drive_backup": True,
+                    "gs_credentials": effective_gs_credentials,
+                    "gs_drive_folder": effective_gs_drive_folder,
+                },
+                force=True,
+            )
+            st.rerun()
 
         st.caption(
             "📌 スプレッドシートのタブ名はジャンル名で自動作成されます"
@@ -1765,11 +1828,11 @@ def render_sidebar() -> dict:
             st.rerun()
 
     return {
-        "serpapi_key": serpapi_key,
-        "gemini_api_key": gemini_api_key,
-        "gs_credentials": gs_credentials,
-        "gs_spreadsheet": gs_spreadsheet,
-        "gs_drive_folder": gs_drive_folder,
+        "serpapi_key": serpapi_key or _get_secret("SERPAPI_KEY"),
+        "gemini_api_key": gemini_api_key or _get_secret("GEMINI_API_KEY"),
+        "gs_credentials": effective_gs_credentials,
+        "gs_spreadsheet": effective_gs_spreadsheet,
+        "gs_drive_folder": effective_gs_drive_folder,
         "auto_sheet_export": auto_sheet_export,
         "auto_drive_backup": auto_drive_backup,
         "delay_seconds": delay_seconds,
@@ -2301,7 +2364,7 @@ def main() -> None:
     _maybe_backup_to_drive(cfg)
 
 
-def _maybe_backup_to_drive(cfg: dict) -> None:
+def _maybe_backup_to_drive(cfg: dict, force: bool = False) -> None:
     """内容が変わったときだけDriveへバックアップ（API節約）。"""
     if not (
         cfg.get("auto_drive_backup")
@@ -2316,15 +2379,22 @@ def _maybe_backup_to_drive(cfg: dict) -> None:
             sort_keys=True,
         )
         content_hash = hash(payload)
-        if st.session_state.get("_drive_backup_hash") == content_hash:
+        if not force and st.session_state.get("_drive_backup_hash") == content_hash:
             return
-        ok, _msg = backup_state_to_drive(
+        ok, msg = backup_state_to_drive(
             cfg["gs_credentials"], cfg["gs_drive_folder"]
         )
         if ok:
             st.session_state["_drive_backup_hash"] = content_hash
-    except Exception:
-        pass
+            st.session_state["_drive_backup_status"] = (
+                f"✅ Driveバックアップ成功: oshigoto_latest.json"
+            )
+        else:
+            st.session_state["_drive_backup_status"] = f"⚠️ Driveバックアップ失敗: {msg}"
+    except Exception as exc:
+        st.session_state["_drive_backup_status"] = (
+            f"⚠️ Driveバックアップ失敗: {exc}"
+        )
 
 
 if __name__ == "__main__":
