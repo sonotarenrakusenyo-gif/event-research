@@ -21,6 +21,7 @@ import re
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
 import os
+import tempfile
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -348,8 +349,60 @@ GENRE_LABELS: list[str] = ["― ジャンルを選択してください ―"] + 
 
 
 # ============================================================
-# セッションステートの初期化
+# セッションステートの初期化 ＆ 結果の永続化（リロードしても残す）
 # ============================================================
+
+# リロードしても保持したいキー（取得結果はAPI枠を使うので消したくない）
+PERSIST_KEYS = [
+    "events",
+    "selected_event",
+    "selected_genre_label",
+    "companies",
+    "excluded_companies",
+    "ai_results",
+    "filtered_companies",
+    "collect_stats",
+]
+
+# 保存先（サーバー上の一時領域。リロードでは消えず、再デプロイ時のみ初期化）
+STATE_FILE = os.path.join(tempfile.gettempdir(), "oshigoto_tool_state.json")
+
+
+def save_state() -> None:
+    """保持対象のセッション内容をファイルに保存する（API消費なし）。"""
+    try:
+        data = {k: st.session_state.get(k) for k in PERSIST_KEYS}
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _load_saved_state() -> None:
+    """保存済みの結果があればセッションに復元する（API消費なし）。"""
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        for key, val in data.items():
+            if val is not None:
+                st.session_state[key] = val
+    except Exception:
+        pass
+
+
+def clear_saved_state() -> None:
+    """保存済みの結果を消去し、セッションも初期化する。"""
+    try:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+    except Exception:
+        pass
+    for key in PERSIST_KEYS:
+        if key in st.session_state:
+            del st.session_state[key]
+
 
 def init_session_state() -> None:
     defaults: dict = {
@@ -360,10 +413,16 @@ def init_session_state() -> None:
         "excluded_companies": [],        # 除外された企業リスト
         "ai_results": [],                # Gemini判定全結果
         "filtered_companies": [],        # 最終絞り込み後リスト
+        "collect_stats": None,           # 収集の内訳
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+
+    # このセッションで未復元なら、保存済みの結果を一度だけ読み込む
+    if not st.session_state.get("_state_loaded"):
+        _load_saved_state()
+        st.session_state["_state_loaded"] = True
 
 
 # ============================================================
@@ -1445,6 +1504,16 @@ def render_sidebar() -> dict:
             if line.strip()
         ]
 
+        st.subheader("🗑️ データのリセット")
+        st.caption(
+            "リロードしても結果は保持されます。"
+            "最初からやり直したいときだけ押してください。"
+        )
+        if st.button("結果をリセット（最初から）", use_container_width=True):
+            clear_saved_state()
+            st.success("保存済みの結果を消去しました。")
+            st.rerun()
+
     return {
         "serpapi_key": serpapi_key,
         "gemini_api_key": gemini_api_key,
@@ -1927,6 +1996,9 @@ def main() -> None:
         render_step3(cfg)
     with tab4:
         render_step4(cfg)
+
+    # 取得結果を保存（次回リロード時に復元され、API枠の無駄遣いを防ぐ）
+    save_state()
 
 
 if __name__ == "__main__":
