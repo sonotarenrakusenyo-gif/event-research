@@ -418,6 +418,40 @@ def _genre_to_sheet_tab(genre_label: str) -> str:
     return (name[:100] if name else "営業リスト")
 
 
+def _custom_genre_from_input(text: str) -> dict:
+    """自由入力テキストから検索用ジャンル情報を生成する。"""
+    word = text.strip()
+    return {
+        "label": word,
+        "keywords": [
+            f"{word} 展示会",
+            f"{word} イベント",
+            f"{word} カンファレンス",
+            f"{word} セミナー",
+            f"{word} EXPO",
+        ],
+    }
+
+
+def _resolve_search_genre(
+    selected_label: str,
+    custom_input: str,
+) -> "tuple[dict | None, str]":
+    """
+    プルダウンまたは自由入力から検索に使うジャンルを決定する。
+    自由入力がある場合はそちらを優先する。
+    """
+    custom = (custom_input or "").strip()
+    if custom:
+        return _custom_genre_from_input(custom), custom
+
+    if selected_label != "― ジャンルを選択してください ―":
+        genre = next((g for g in GENRE_LIST if g["label"] == selected_label), None)
+        if genre:
+            return genre, selected_label
+    return None, ""
+
+
 def _get_secret(key: str, default: str = "") -> str:
     """Streamlit Secrets → 環境変数 → デフォルトの順で設定値を取得する。"""
     try:
@@ -1929,31 +1963,42 @@ def render_sidebar() -> dict:
 def render_step1(cfg: dict) -> None:
     st.header("🔍 STEP 1 ― ジャンル選択 → 完全自動イベントリサーチ")
     st.info(
-        "ジャンルを選択してボタンを押すと、GoogleとGeminiが連動して\n"
+        "50カテゴリから選ぶか、自由入力欄にジャンル名（例: ゲーム）を入れて\n"
+        "「自動リサーチ開始」を押すと、GoogleとGeminiが連動して\n"
         "東京都内・近郊で開催されるイベントを**全自動でリサーチ**します。"
     )
 
-    # ① ジャンル選択
+    # ① ジャンル選択（50カテゴリ）
     selected_label = st.selectbox(
         "📂 イベントジャンル（50カテゴリ）",
         options=GENRE_LABELS,
         index=0,
-        help="選択すると対応するキーワードで自動検索します",
+        help="リストから選ぶ場合はこちら。自由入力がある場合はそちらが優先されます",
     )
 
-    genre: dict | None = None
-    if selected_label != "― ジャンルを選択してください ―":
-        genre = next((g for g in GENRE_LIST if g["label"] == selected_label), None)
+    # ② 自由入力ジャンル（任意・入力時はこちらを優先）
+    custom_genre_input = st.text_input(
+        "✏️ 自由入力ジャンル（任意）",
+        placeholder="例: ゲーム / eスポーツ / 防災",
+        help="50カテゴリにないジャンルを調べたいときに入力。入力するとプルダウンより優先されます",
+    )
 
-    # 選択ジャンルのキーワード一覧を表示
+    genre, active_label = _resolve_search_genre(selected_label, custom_genre_input)
+    using_custom = bool((custom_genre_input or "").strip())
+
+    if using_custom:
+        st.caption(f"🔎 自由入力 **「{active_label}」** でリサーチします（50カテゴリより優先）")
+
+    # 検索キーワード一覧を表示
     if genre:
-        with st.expander(f"💡 「{selected_label}」の検索キーワード候補"):
+        source = "自由入力" if using_custom else "50カテゴリ"
+        with st.expander(f"💡 「{active_label}」の検索キーワード候補（{source}）"):
             st.caption(f"上位 {cfg['max_queries']} 件のキーワードを使用します（サイドバーで変更可）")
             for i, kw in enumerate(genre["keywords"]):
                 mark = "✅" if i < cfg["max_queries"] else "⬜"
                 st.markdown(f"{mark} `{kw}`")
 
-    # ② 自動リサーチ実行ボタン
+    # ③ 自動リサーチ実行ボタン
     st.divider()
     col_btn, col_info = st.columns([2, 3])
     with col_btn:
@@ -1965,15 +2010,16 @@ def render_step1(cfg: dict) -> None:
         )
     with col_info:
         if genre is None:
-            st.warning("⬅️ まずジャンルを選択してください")
+            st.warning("⬅️ 50カテゴリを選ぶか、自由入力欄にジャンル名を入力してください")
         else:
             st.caption(
+                f"**対象ジャンル:** {active_label}\n\n"
                 f"**処理内容**:\n"
                 f"1. Google検索（{cfg['max_queries']}クエリ）でイベント候補を収集\n"
                 f"2. Gemini APIでイベントを整理・絞り込み（1回のみ）"
             )
 
-    if search_clicked:
+    if search_clicked and genre:
         if not cfg["serpapi_key"]:
             st.error("⚠️ SerpAPI Key を設定してください")
             return
@@ -1982,7 +2028,7 @@ def render_step1(cfg: dict) -> None:
             return
 
         # ステップA: SerpAPI（Google検索）
-        with st.spinner(f"🔍 Googleで「{selected_label}」関連イベントを検索中…"):
+        with st.spinner(f"🔍 Googleで「{active_label}」関連イベントを検索中…"):
             candidates = auto_research_events(
                 genre, cfg["serpapi_key"], cfg["max_queries"], cfg["target_years"]
             )
@@ -1996,11 +2042,11 @@ def render_step1(cfg: dict) -> None:
         # ステップB: Gemini整理
         with st.spinner("🤖 GeminiがイベントリストをAIで整理中（1〜2分かかる場合があります）…"):
             events = validate_events_with_gemini(
-                candidates, selected_label, cfg["gemini_api_key"], cfg["target_years"]
+                candidates, active_label, cfg["gemini_api_key"], cfg["target_years"]
             )
 
         st.session_state.events = events
-        st.session_state.selected_genre_label = selected_label
+        st.session_state.selected_genre_label = active_label
         # 選択変更時に後続をリセット
         st.session_state.selected_event = None
         st.session_state.companies = []
