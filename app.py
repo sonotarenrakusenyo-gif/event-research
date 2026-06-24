@@ -25,6 +25,7 @@ from urllib.parse import urljoin, urlparse
 from datetime import datetime
 import os
 import tempfile
+import zipfile
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -368,6 +369,7 @@ PERSIST_KEYS = [
     "ai_results",
     "filtered_companies",
     "collect_stats",
+    "sales_emails",
 ]
 
 # 保存先（サーバー上の一時領域。同一サーバー稼働中のリロードでは残るが、
@@ -639,7 +641,7 @@ def import_companies_from_csv(uploaded_file) -> "tuple[bool, str]":
         if genre and genre != "不明":
             st.session_state.selected_genre_label = genre
         save_state()
-        return True, f"{len(companies)} 社を復元しました（STEP4から利用可能）"
+        return True, f"{len(companies)} 社を復元しました（STEP4 / STEP5 から利用可能）"
     except Exception as exc:
         return False, f"CSV復元エラー: {exc}"
 
@@ -654,6 +656,7 @@ def init_session_state() -> None:
         "ai_results": [],                # Gemini判定全結果
         "filtered_companies": [],        # 最終絞り込み後リスト
         "collect_stats": None,           # 収集の内訳
+        "sales_emails": {},              # 企業キー → 営業メール全文
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -2447,6 +2450,360 @@ def render_step4(cfg: dict) -> None:
             else:
                 st.error(f"❌ {message}")
 
+    st.divider()
+    st.caption("➡️ 営業メールを作成する場合は **STEP5** タブへ進んでください")
+
+
+# ============================================================
+# STEP5: 営業メール生成
+# ============================================================
+
+SALES_EMAIL_SUBJECT = "【MC/アナウンス業務のご提案】"
+
+EMAIL_GREETING_LINES = (
+    "突然のご連絡にて失礼いたします。\n"
+    "貴社のホームページを拝見し、初めてご連絡差し上げました、\n"
+    "フリーアナウンサーの小島瑠夏（こじま るか）と申します。"
+)
+
+EMAIL_ACHIEVEMENT = (
+    "普段は大型イベント、セミナーや講演会、記者・新製品発表会、展示会をはじめ、"
+    "YouTube、トークショー、スタジアムMCなど、幅広いアナウンス業務を担当しております。"
+)
+
+EMAIL_FOLLOWUP = (
+    "もし同イベントで間に合っている場合でも、今後のイベントや各種セミナーなどの"
+    "機会がございましたら、ぜひお声がけいただければ幸いです。"
+)
+
+EMAIL_PRICE = (
+    "事務所を通さない直接契約となりますため、中間マージンが発生せず、"
+    "プロのクオリティはそのままにリーズナブルで柔軟な対応が可能です。"
+)
+
+EMAIL_CLOSING = (
+    "まずはメールでのご相談や、15分程度のオンラインでのご挨拶だけでも大歓迎です。\n"
+    "ご興味がございましたら、ぜひ一度お気軽にご連絡いただけますと幸いです。\n\n"
+    "何卒よろしくお願い申し上げます。"
+)
+
+EMAIL_SIGNATURE = """━━━━━━━━━━━━━━━━━━━━━━━━━━
+フリーアナウンサー
+小島 瑠夏（こじま るか）
+
+▼ 公式ホームページ
+https://ruka-kojima-mc-profile.vercel.app/
+
+▼ 価格表 / 参考動画 / ボイスサンプル
+※ダウンロード不要で、そのまま直接ご確認いただけます。
+https://drive.google.com/drive/folders/1q2CS8DlVEjSy7_fiZ2AaDtN4yqLA3EGR
+
+▼ お問い合わせ・SNS
+Email：kojimaruka.oshigotosenyo@gmail.com
+Instagram：@kojima_ruka
+https://www.instagram.com/kojima_ruka?igsh=MXJ2bzU2Y2VnbmRpZg%3D%3D&utm_source=qr
+━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+
+
+def _company_key_str(company: dict) -> str:
+    """営業メールの保存キー（JSONシリアライズ可能な文字列）。"""
+    name, url = _company_key(company)
+    return f"{name}|{url}"
+
+
+def _sanitize_path_component(name: str, max_len: int = 80) -> str:
+    """ZIP内フォルダ名用に禁止文字を除去する。"""
+    s = re.sub(r'[\\/:*?"<>|]', "_", (name or "不明").strip())
+    s = re.sub(r"\s+", " ", s).strip(". ")
+    return (s[:max_len] if s else "不明")
+
+
+def _format_addressee_block(company: dict) -> str:
+    """宛名2行（会社名 + イベント企画ご担当者様）。"""
+    company_name = (company.get("name") or "貴社").strip()
+    return f"{company_name}\nイベント企画ご担当者様"
+
+
+def _assemble_sales_email(company: dict, personal_paragraph: str) -> str:
+    """固定テンプレートとAI生成段落を結合して完成メールを作る。"""
+    parts = [
+        f"件名：{SALES_EMAIL_SUBJECT}",
+        "",
+        _format_addressee_block(company),
+        "",
+        EMAIL_GREETING_LINES,
+        "",
+        EMAIL_ACHIEVEMENT,
+        "",
+        personal_paragraph.strip(),
+        "",
+        EMAIL_FOLLOWUP,
+        "",
+        EMAIL_PRICE,
+        "",
+        EMAIL_CLOSING,
+        "",
+        EMAIL_SIGNATURE,
+    ]
+    return "\n".join(parts)
+
+
+def _generate_personal_paragraph(
+    company: dict,
+    model: "genai.GenerativeModel",
+    genre_label: str,
+) -> "tuple[str, str]":
+    """
+    企業・イベント情報から個別アピール段落をGeminiで生成する。
+    Returns: (paragraph, error_message)
+    """
+    timing = company.get("event_timing", "不明")
+    event_name = company.get("event_name", "不明")
+    details = company.get("event_details", "不明")
+    mc_job = company.get("mc_job", "不明")
+    mc_scene = company.get("mc_scene", "不明")
+    company_name = company.get("name", "不明")
+    url = company.get("url", "")
+
+    prompt = f"""あなたはフリーアナウンサーの営業メール作成アシスタントです。
+以下の企業情報をもとに、営業メール本文の「個別アピール段落」だけを1〜2文で書いてください。
+
+【企業・イベント情報】
+- ジャンル: {genre_label}
+- 企業名: {company_name}
+- 企業URL: {url}
+- イベント名: {event_name}
+- 開催時期: {timing}
+- イベント詳細: {details}
+- MC業務内容: {mc_job}
+- MC想定シーン: {mc_scene}
+
+【必須の書き方】
+- ビジネス丁寧体（です・ます調）
+- 120〜220文字程度
+- 「御社のHPなどを拝見し、{timing}開催の「{event_name}」に出展/開催されるとお見受けし、」のような個別感
+- 貴社の製品・サービス・イベント内容に触れ、MCとしてどう貢献できるかを簡潔に
+- 開催時期が不明なら「近日開催の」など自然な表現に置き換える
+- イベント名が不明なら「関連イベント」など自然な表現に置き換える
+- 文末は「ぜひお力添えしたくご連絡いたしました。」で終える
+
+【出力ルール】
+- 段落の本文のみ出力（挨拶・署名・件名は不要）
+- 箇条書き・Markdown・引用符で囲まない
+"""
+    try:
+        response = gemini_generate(model, prompt)
+        text = (response.text or "").strip()
+        text = re.sub(r"^[\"「『]+|[\"」』]+$", "", text)
+        if not text:
+            return "", "AIが空の応答を返しました"
+        return text, ""
+    except Exception as exc:
+        return "", str(exc)
+
+
+def generate_sales_email_for_company(
+    company: dict,
+    model: "genai.GenerativeModel",
+    genre_label: str,
+) -> "tuple[str, str]":
+    """1社分の完成メールを生成する。Returns: (email_text, error_message)"""
+    paragraph, err = _generate_personal_paragraph(company, model, genre_label)
+    if err:
+        return "", err
+    return _assemble_sales_email(company, paragraph), ""
+
+
+def run_sales_email_generation(
+    companies: list[dict],
+    gemini_api_key: str,
+    delay_seconds: int,
+    genre_label: str,
+    progress_bar,
+    status_text,
+) -> "tuple[int, bool]":
+    """
+    企業ごとに営業メールを生成（途中再開対応）。
+    Returns: (新規生成件数, 無料枠切れで中断したか)
+    """
+    genai.configure(api_key=gemini_api_key)
+    model = genai.GenerativeModel(resolve_gemini_model())
+
+    if st.session_state.get("sales_emails") is None:
+        st.session_state.sales_emails = {}
+    emails: dict = dict(st.session_state.sales_emails)
+    total = len(companies)
+    quota_stopped = False
+    newly_done = 0
+
+    for i, company in enumerate(companies):
+        key = _company_key_str(company)
+        if key in emails and emails[key]:
+            progress_bar.progress((i + 1) / total)
+            continue
+
+        status_text.markdown(
+            f"**メール作成中 ({i + 1} / {total}):** {company.get('name', '不明')}　"
+            f"（Gemini生成 → {delay_seconds}秒待機）"
+        )
+        email_text, err = generate_sales_email_for_company(company, model, genre_label)
+
+        if err and _is_quota_error(err):
+            quota_stopped = True
+            break
+        if err:
+            status_text.warning(f"⚠️ {company.get('name', '不明')}: {err}")
+            progress_bar.progress((i + 1) / total)
+            if i < total - 1:
+                time.sleep(delay_seconds)
+            continue
+
+        emails[key] = email_text
+        st.session_state.sales_emails = emails
+        save_state()
+        newly_done += 1
+        progress_bar.progress((i + 1) / total)
+
+        if i < total - 1:
+            time.sleep(delay_seconds)
+
+    return newly_done, quota_stopped
+
+
+def build_sales_email_zip(
+    companies: list[dict],
+    sales_emails: dict,
+    genre_label: str,
+) -> bytes:
+    """ジャンル/企業/営業メール.txt 構成のZIPを生成する。"""
+    genre_folder = _sanitize_path_component(_genre_to_sheet_tab(genre_label))
+    used_names: dict[str, int] = {}
+    buf = io.BytesIO()
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for company in companies:
+            key = _company_key_str(company)
+            email_text = sales_emails.get(key)
+            if not email_text:
+                continue
+
+            base_name = _sanitize_path_component(company.get("name", "不明"))
+            count = used_names.get(base_name, 0)
+            used_names[base_name] = count + 1
+            folder_name = base_name if count == 0 else f"{base_name}_{count + 1}"
+
+            arc_path = f"{genre_folder}/{folder_name}/営業メール.txt"
+            info = zipfile.ZipInfo(arc_path)
+            info.flag_bits |= 0x800
+            zf.writestr(info, email_text.encode("utf-8"))
+
+    return buf.getvalue()
+
+
+def render_step5(cfg: dict) -> None:
+    st.header("✉️ STEP 5 ― 営業メール生成（ZIPダウンロード）")
+    st.info(
+        "STEP3/4 で絞り込んだ企業リスト、または **CSV復元** したリストをもとに、"
+        "各社宛ての営業メールをAIで作成します。\n\n"
+        "完成後は **ジャンル/企業名/営業メール.txt** 形式のZIPを **1回** ダウンロードできます。"
+    )
+
+    if not st.session_state.filtered_companies:
+        st.warning(
+            "👆 先に **STEP3** で絞り込むか、サイドバーの **営業リストCSVから復元** "
+            "で企業リストを読み込んでください。"
+        )
+        return
+
+    companies = st.session_state.filtered_companies
+    genre_label = st.session_state.get("selected_genre_label", "不明")
+    if genre_label == "不明" and companies:
+        genre_label = companies[0].get("genre_label", "営業リスト")
+
+    emails: dict = st.session_state.get("sales_emails") or {}
+    done_count = sum(
+        1 for c in companies if emails.get(_company_key_str(c))
+    )
+    remaining = len(companies) - done_count
+
+    st.success(
+        f"**{len(companies)} 社**が対象です（メール作成済み **{done_count}** 社 / "
+        f"残り **{remaining}** 社）"
+    )
+    st.caption(
+        f"ジャンル: **{_genre_to_sheet_tab(genre_label)}** ／ "
+        f"件名: **{SALES_EMAIL_SUBJECT}** ／ 宛名: 会社名 + イベント企画ご担当者様"
+    )
+
+    if remaining > 0:
+        btn_label = (
+            "✉️ 営業メールを一括生成する"
+            if done_count == 0
+            else f"▶️ 続きから営業メールを生成（残り {remaining} 社）"
+        )
+        if st.button(btn_label, type="primary", use_container_width=True):
+            if not cfg["gemini_api_key"]:
+                st.error("⚠️ Gemini API Key を設定してください")
+                return
+
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            newly_done, quota_stopped = run_sales_email_generation(
+                companies,
+                cfg["gemini_api_key"],
+                cfg["delay_seconds"],
+                genre_label,
+                progress_bar,
+                status_text,
+            )
+            if quota_stopped:
+                st.warning(
+                    "⚠️ Gemini API の無料枠上限に達したため中断しました。"
+                    "時間をおいて **続きから** 再開できます。"
+                )
+            elif newly_done > 0:
+                st.success(f"✅ {newly_done} 社分のメールを作成しました")
+            st.rerun()
+
+    emails = st.session_state.get("sales_emails") or {}
+    done_count = sum(1 for c in companies if emails.get(_company_key_str(c)))
+
+    if done_count > 0:
+        st.divider()
+        st.subheader("📥 ZIPダウンロード")
+        genre_tab = _genre_to_sheet_tab(genre_label)
+        zip_name = f"営業メール_{genre_tab}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+        zip_bytes = build_sales_email_zip(companies, emails, genre_label)
+
+        st.download_button(
+            label=f"📦 営業メールZIPをダウンロード（{done_count} 社分）",
+            data=zip_bytes,
+            file_name=zip_name,
+            mime="application/zip",
+            use_container_width=True,
+            type="primary",
+        )
+        st.caption(
+            f"ZIPを解凍すると `{genre_tab}/企業名/営業メール.txt` の構成になります。"
+            "Macのテキストエディットで開いてコピーし、メール送信にご利用ください。"
+        )
+
+        with st.expander("📋 作成済みメールのプレビュー"):
+            preview_limit = 5
+            shown = 0
+            for company in companies:
+                key = _company_key_str(company)
+                text = emails.get(key)
+                if not text:
+                    continue
+                st.markdown(f"**{company.get('name', '不明')}**")
+                st.text(text[:1200] + ("…" if len(text) > 1200 else ""))
+                st.divider()
+                shown += 1
+                if shown >= preview_limit and done_count > preview_limit:
+                    st.caption(f"他 {done_count - preview_limit} 社はZIP内に含まれています")
+                    break
+
 
 # ============================================================
 # メインエントリーポイント
@@ -2464,17 +2821,18 @@ def main() -> None:
 
     st.title("🎯 お仕事受注企業選定ツール")
     st.caption(
-        "ジャンル選択 → Google ＋ Gemini で全自動イベント検索 → 企業収集 → AI絞り込み → CSV出力\n"
+        "ジャンル選択 → イベント検索 → 企業収集 → AI絞り込み → CSV出力 → 営業メール生成\n"
         "エル・アミティエ・フェアリィ関連は企業段階で自動除外"
     )
 
     cfg = render_sidebar()
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🔍 STEP1: 自動イベント検索",
         "🏢 STEP2: 企業収集",
         "🤖 STEP3: AI絞り込み",
         "📤 STEP4: CSV・スプレッドシート出力",
+        "✉️ STEP5: 営業メール生成",
     ])
 
     with tab1:
@@ -2485,6 +2843,8 @@ def main() -> None:
         render_step3(cfg)
     with tab4:
         render_step4(cfg)
+    with tab5:
+        render_step5(cfg)
 
     save_state()
     _maybe_auto_backup(cfg)
