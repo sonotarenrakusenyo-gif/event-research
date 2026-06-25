@@ -605,23 +605,33 @@ def backup_state_to_drive(credentials_json_str: str, folder_id: str) -> "tuple[b
         return False, f"Driveバックアップエラー: {exc}"
 
 
+def _csv_cell(value, default: str = "不明") -> str:
+    """CSVセルを文字列に正規化する（NaN・空欄対応）。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return default
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return default
+    return text
+
+
 def _csv_row_to_company(row: pd.Series) -> dict:
     """CSVの1行を filtered_companies 用の dict に変換する。"""
     return {
-        "genre_label": row.get("イベントジャンル（50選）", "不明"),
-        "event_name": row.get("AIが自動リサーチしたイベント名", "不明"),
-        "name": row.get("企業名", ""),
-        "url": row.get("企業のHP URL", ""),
-        "contact": row.get("連絡先（代表メールや問い合わせ窓口）", "不明"),
-        "contact_title": row.get("担当者肩書", "不明"),
-        "contact_name": row.get("担当者名", "不明"),
-        "event_timing": row.get("イベント開催時期", "不明"),
-        "event_venue": row.get("開催会場", "不明"),
-        "event_format": row.get("イベント形式", "不明"),
-        "event_details": row.get("ジャンルや特徴・詳細", "不明"),
-        "mc_job": row.get("ステージの種類・MC業務内容", "不明"),
-        "mc_scene": row.get("MCの想定シーン", "不明"),
-        "source": row.get("情報ソース", ""),
+        "genre_label": _csv_cell(row.get("イベントジャンル（50選）", "不明")),
+        "event_name": _csv_cell(row.get("AIが自動リサーチしたイベント名", "不明")),
+        "name": _csv_cell(row.get("企業名", ""), ""),
+        "url": _csv_cell(row.get("企業のHP URL", ""), ""),
+        "contact": _csv_cell(row.get("連絡先（代表メールや問い合わせ窓口）", "不明")),
+        "contact_title": _csv_cell(row.get("担当者肩書", "不明")),
+        "contact_name": _csv_cell(row.get("担当者名", "不明")),
+        "event_timing": _csv_cell(row.get("イベント開催時期", "不明")),
+        "event_venue": _csv_cell(row.get("開催会場", "不明")),
+        "event_format": _csv_cell(row.get("イベント形式", "不明")),
+        "event_details": _csv_cell(row.get("ジャンルや特徴・詳細", "不明")),
+        "mc_job": _csv_cell(row.get("ステージの種類・MC業務内容", "不明")),
+        "mc_scene": _csv_cell(row.get("MCの想定シーン", "不明")),
+        "source": _csv_cell(row.get("情報ソース", ""), ""),
     }
 
 
@@ -1335,12 +1345,17 @@ def extract_companies_with_gemini(
         return []
 
 
-def _normalize_company_name(name: str) -> str:
+def _normalize_company_name(name) -> str:
     """重複判定用に企業名を正規化する（法人格・空白・記号を除去）。"""
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return ""
+    text = str(name).strip()
+    if not text or text.lower() == "nan":
+        return ""
     cleaned = re.sub(
         r"(株式会社|有限会社|合同会社|一般社団法人|公益財団法人|株|\(株\)|（株）|"
         r"Co\.,?\s?Ltd\.?|Inc\.?|Corp\.?|Corporation|Company|Limited)",
-        "", name, flags=re.IGNORECASE,
+        "", text, flags=re.IGNORECASE,
     )
     cleaned = re.sub(r"[\s　・,.，。\-—|｜/]", "", cleaned)
     return cleaned.lower()
@@ -2386,6 +2401,7 @@ def render_step4(cfg: dict) -> None:
 
     companies = st.session_state.filtered_companies
     st.success(f"**{len(companies)} 社**の営業リストが完成しました")
+    st.caption("➡️ スプレッドシートに既にある場合は **STEP4 をスキップ** して **STEP5** へ進めます")
 
     with st.expander("📋 出力データのプレビュー（全15列）"):
         st.dataframe(_build_csv_dataframe(companies), use_container_width=True, hide_index=True)
@@ -2722,6 +2738,24 @@ def render_step5(cfg: dict) -> None:
         genre_label = companies[0].get("genre_label", "営業リスト")
 
     emails: dict = st.session_state.get("sales_emails") or {}
+    if not isinstance(emails, dict):
+        emails = {}
+        st.session_state.sales_emails = {}
+
+    valid_companies = [
+        c for c in companies
+        if _csv_cell(c.get("name", ""), "").strip()
+    ]
+    if len(valid_companies) < len(companies):
+        st.warning(
+            f"⚠️ 企業名が空の行 {len(companies) - len(valid_companies)} 件をスキップします。"
+            "スプレッドシートの空行を削除してからCSVを再アップロードすると安全です。"
+        )
+    companies = valid_companies
+    if not companies:
+        st.error("有効な企業名がありません。CSVの「企業名」列を確認してください。")
+        return
+
     done_count = sum(
         1 for c in companies if emails.get(_company_key_str(c))
     )
