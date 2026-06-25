@@ -637,6 +637,7 @@ def import_companies_from_csv(uploaded_file) -> "tuple[bool, str]":
             return False, "有効な企業データがありません"
         st.session_state.filtered_companies = companies
         st.session_state.ai_results = companies
+        st.session_state.sales_emails = {}  # リスト差し替え時はメール生成も最初から
         genre = companies[0].get("genre_label", "不明")
         if genre and genre != "不明":
             st.session_state.selected_genre_label = genre
