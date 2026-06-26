@@ -2484,9 +2484,11 @@ SALES_EMAIL_BODY_TEMPLATE = """{company_name}
 突然のご連絡にて失礼いたします。
 フリーアナウンサーの小島瑠夏（こじま るか）と申します。
 
-普段は大型イベント、セミナーや講演会、記者・新製品発表会、展示会をはじめ、YouTube、トークショー、スタジアムMCなど、幅広いアナウンス業務を担当しております。
+普段は大型イベント、セミナーや講演会、記者・新製品発表会、展示会をはじめ、
+YouTube、トークショー、スタジアムMCなど、幅広いアナウンス業務を担当しております。
 
-貴社のホームページを拝見し出展予定の展示会やセミナーなどで、{product_service}の魅力を来場者へお伝えするブースMCをはじめ、
+貴社のホームページを拝見し出展予定の展示会やセミナーなどで、
+{product_service}の魅力を来場者へお伝えするブースMCをはじめ、
 登壇者紹介や進行補助、掛け合い対応などのアナウンス業務を通じて、イベントの成功にお力添えできるのではないかと思いご連絡いたしました。
 
 もし既にご手配済みの場合でも今後機会がございましたら、ぜひお声がけいただければ幸いです。
@@ -2550,12 +2552,16 @@ def _research_email_placeholders(
     event_details = _csv_cell(company.get("event_details", ""), "不明")
     mc_job = _csv_cell(company.get("mc_job", ""), "不明")
 
-    page_text = _scrape_company_page(url) if url and url != "不明" else ""
+    page_text = (
+        _scrape_company_page(url, max_chars=4000)
+        if url and url != "不明"
+        else ""
+    )
 
     prompt = f"""あなたはBtoB営業メール用の企業リサーチアシスタントです。
-以下の情報とホームページ本文（あれば）から、営業メールテンプレートの【 】部分に入れる値だけを調べてください。
+企業ホームページの実情報に基づき、営業メールテンプレートの【 】部分に入れる値だけを調べてください。
 
-【リスト上の情報】
+【リスト上の情報（参考）】
 - ジャンル: {genre_label}
 - 企業名（リスト）: {default_name}
 - 企業URL: {url}
@@ -2563,40 +2569,69 @@ def _research_email_placeholders(
 - イベント詳細: {event_details}
 - MC業務内容: {mc_job}
 
-【ホームページ本文（抜粋）】
+【ホームページ本文（最重要・抜粋）】
 {page_text or "（取得できませんでした）"}
 
 【出力形式】JSONのみ（説明不要）:
 {{
   "company_name": "正式な企業名（例: 株式会社スカイコム）",
-  "product_service": "主力製品・サービスを自然な日本語句で（例: FINANCIAL SOLUTIONやAIネイティブな次世代型ERP等のデジタルオファリングサービス）"
+  "product_service": "HP上の実在する主力製品・サービス名を自然な日本語句で"
 }}
 
-【ルール】
-- product_service は、本文「…{{product_service}}の魅力を来場者へ…」にそのまま入る句にする
-- 複数製品は「AやB等の○○サービス」のように「や」「等の」でつないでもよい
-- 20〜80文字程度。末尾に「。」を付けない
+【product_service の定義（最重要）】
+- **必ずホームページ本文に実際に載っている**製品名・サービス名・ソリューション名を使う
+- トップページや製品紹介で**いちばん強調されている主力**を選ぶ（複数なら「AやB等の○○」でつなぐ）
+- **架空の名称を作らない**。HPに無い固有名詞は使わない
+- 本文「…{{product_service}}の魅力を来場者へ…」にそのまま入る句にする（20〜80文字、末尾に「。」なし）
 - 御社は使わない
+
+【優先順位】
+1. ホームページに明記された製品・サービス・ソリューション名（最優先）
+2. HPが取得できない場合のみ、イベント詳細・ジャンルから推定（一般名詞中心。固有名詞の創作禁止）
+3. 「貴社のサービス・ソリューション」のような抽象語だけの回答は、HPを読んでも特定できない場合のみ
+
+【company_name】
 - リストの企業名が正しければそのまま使ってよい
-- 製品名が特定できない場合は、イベント詳細やジャンルから自然な一般表現（例: 金融向けITソリューション）にする
+- HPの正式表記と異なる場合はHPに合わせる
 """
     try:
         response = gemini_generate(model, prompt)
         parsed = _extract_json(response.text or "")
         if isinstance(parsed, dict):
             name = _csv_cell(parsed.get("company_name", default_name), default_name)
-            product = _csv_cell(
-                parsed.get("product_service", ""),
-                "貴社のサービス・ソリューション",
-            )
+            product = _csv_cell(parsed.get("product_service", ""), "")
             if product in ("不明", ""):
-                product = "貴社のサービス・ソリューション"
+                product = _fallback_product_service(event_details, genre_label, page_text)
             return name, product, ""
-        return default_name, "貴社のサービス・ソリューション", "AI応答のJSON解析に失敗しました"
+        return (
+            default_name,
+            _fallback_product_service(event_details, genre_label, page_text),
+            "AI応答のJSON解析に失敗しました",
+        )
     except Exception as exc:
         if _is_quota_error(str(exc)):
             return "", "", str(exc)
-        return default_name, "貴社のサービス・ソリューション", str(exc)
+        return (
+            default_name,
+            _fallback_product_service(event_details, genre_label, page_text),
+            str(exc),
+        )
+
+
+def _fallback_product_service(
+    event_details: str,
+    genre_label: str,
+    page_text: str,
+) -> str:
+    """HP取得・AI解析が不十分なときの最終フォールバック。"""
+    if page_text:
+        return "貴社の主力ソリューション"
+    if event_details and event_details != "不明":
+        return f"{event_details}に関連する貴社の取り組み"
+    if genre_label and genre_label != "不明":
+        tab = _genre_to_sheet_tab(genre_label)
+        return f"{tab}分野の貴社のサービス"
+    return "貴社の主力サービス"
 
 
 def generate_sales_email_for_company(
