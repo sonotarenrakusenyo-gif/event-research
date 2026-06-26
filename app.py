@@ -2477,49 +2477,37 @@ def render_step4(cfg: dict) -> None:
 
 SALES_EMAIL_SUBJECT = "【MC/アナウンス業務のご提案】"
 
-EMAIL_GREETING_LINES = (
-    "突然のご連絡にて失礼いたします。\n"
-    "貴社のホームページを拝見し、初めてご連絡差し上げました、\n"
-    "フリーアナウンサーの小島瑠夏（こじま るか）と申します。"
-)
+# 【 】部分のみAIが置換。それ以外は一言一句このテンプレートどおり。
+SALES_EMAIL_BODY_TEMPLATE = """{company_name}
+イベント・セミナーご担当者様
 
-EMAIL_ACHIEVEMENT = (
-    "普段は大型イベント、セミナーや講演会、記者・新製品発表会、展示会をはじめ、"
-    "YouTube、トークショー、スタジアムMCなど、幅広いアナウンス業務を担当しております。"
-)
+突然のご連絡にて失礼いたします。
+フリーアナウンサーの小島瑠夏（こじま るか）と申します。
 
-EMAIL_FOLLOWUP = (
-    "もし同イベントで間に合っている場合、上記イベントに出展されない場合でも、"
-    "今後のイベントや各種セミナーなどの機会がございましたら、"
-    "ぜひお声がけいただけますと幸いです。"
-)
+普段は大型イベント、セミナーや講演会、記者・新製品発表会、展示会をはじめ、YouTube、トークショー、スタジアムMCなど、幅広いアナウンス業務を担当しております。
 
-EMAIL_PRICE = (
-    "事務所を通さない直接契約となりますため、中間マージンが発生せず、"
-    "プロのクオリティはそのままにリーズナブルで柔軟な対応が可能です。"
-)
+貴社のホームページを拝見し、出展予定の展示会やセミナーなどで、{product_service}の魅力を来場者へお伝えするブースMCをはじめ、登壇者紹介や進行補助、掛け合い対応などのアナウンス業務を通じて、イベントの成功にお力添えできるのではないかと思い、ご連絡いたしました。
 
-EMAIL_CLOSING = (
-    "まずはメールや15分程度のオンラインでのご挨拶、ご相談だけでも大歓迎です。\n"
-    "ご興味がございましたら、ぜひ一度お気軽にご連絡いただけますと幸いです。\n\n"
-    "何卒よろしくお願い申し上げます。"
-)
+もし既にご手配済みの場合でも、今後機会がございましたら、ぜひお声がけいただければ幸いです。
+事務所を通さない直接契約となりますため、金額面などでも柔軟な対応が可能となっております。
+まずはメールでのご相談や、15分程度のオンラインでのご挨拶だけでも大歓迎です。ご興味をお持ちいただけましたら、まずはお気軽にご連絡いただけますと幸いです。
 
-EMAIL_SIGNATURE = """━━━━━━━━━━━━━━━━━━━━━━━━━━
+何卒よろしくお願い申し上げます。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 フリーアナウンサー
 小島 瑠夏（こじま るか）
 
 ▼ 公式ホームページ
 https://ruka-kojima-mc-profile.vercel.app/
 
-▼ 価格表 / 参考動画 / ボイスサンプル
-※ダウンロード不要で、そのまま直接ご確認いただけます。
+▼ 料金表 / 参考動画 / ボイスサンプル
+※ダウンロード不要で、そのままURLを押すだけで直接ご確認いただけます。
+
 https://drive.google.com/drive/folders/1q2CS8DlVEjSy7_fiZ2AaDtN4yqLA3EGR
 
-▼ お問い合わせ・SNS
+▼ お問い合わせ
 Email：kojimaruka.oshigotosenyo@gmail.com
-Instagram：@kojima_ruka
-https://www.instagram.com/kojima_ruka?igsh=MXJ2bzU2Y2VnbmRpZg%3D%3D&utm_source=qr
 ━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
 
@@ -2536,129 +2524,77 @@ def _sanitize_path_component(name: str, max_len: int = 80) -> str:
     return (s[:max_len] if s else "不明")
 
 
-def _format_addressee_block(company: dict) -> str:
-    """宛名2行（会社名 + イベント企画ご担当者様）。"""
-    company_name = (company.get("name") or "貴社").strip()
-    return f"{company_name}\nイベント企画ご担当者様"
-
-
-def _assemble_sales_email(company: dict, personal_paragraph: str) -> str:
-    """固定テンプレートとAI生成段落を結合して完成メールを作る。"""
-    parts = [
-        f"件名：{SALES_EMAIL_SUBJECT}",
-        "",
-        _format_addressee_block(company),
-        "",
-        EMAIL_GREETING_LINES,
-        "",
-        EMAIL_ACHIEVEMENT,
-        "",
-        personal_paragraph.strip(),
-        "",
-        EMAIL_FOLLOWUP,
-        "",
-        EMAIL_PRICE,
-        "",
-        EMAIL_CLOSING,
-        "",
-        EMAIL_SIGNATURE,
-    ]
-    return "\n".join(parts)
-
-
-def _polish_personal_paragraph(text: str) -> str:
-    """生成段落の表現をテンプレートルールに合わせて整える。"""
-    text = (text or "").strip()
-    text = text.replace("御社", "貴社")
-    # 冒頭挨拶と重複する「HP拝見」表現を除去
-    text = re.sub(
-        r"^貴社の(?:ホームページ|HP)(?:など)?を拝見し[、,]?\s*",
-        "",
-        text,
+def _assemble_sales_email(company_name: str, product_service: str) -> str:
+    """固定テンプレートに企業名・主力製品/サービスのみ差し込んで完成メールを作る。"""
+    body = SALES_EMAIL_BODY_TEMPLATE.format(
+        company_name=company_name.strip(),
+        product_service=product_service.strip(),
     )
-    text = re.sub(
-        r"^貴社の(?:ホームページ|HP)(?:など)?を拝見し、初めてご連絡[^、。]*[、,]?\s*",
-        "",
-        text,
-    )
-    # 強い断定表現を柔らかく
-    text = text.replace("確信しております", "のではないかと思い、ご連絡をいたしました")
-    text = text.replace("確信しています", "のではないかと思い、ご連絡をいたしました")
-    text = text.replace("ぜひお力添えしたくご連絡いたしました", "ご連絡をいたしました")
-    # 文末を統一（謙虚な締め）
-    if text and not text.endswith("。"):
-        text += "。"
-    if not re.search(r"ご連絡(?:を)?いたしました", text):
-        text = re.sub(r"[。．]+$", "", text)
-        text += "ご連絡をいたしました。"
-    return text
+    return f"件名：{SALES_EMAIL_SUBJECT}\n\n{body}"
 
 
-def _generate_personal_paragraph(
+def _research_email_placeholders(
     company: dict,
     model: "genai.GenerativeModel",
     genre_label: str,
-) -> "tuple[str, str]":
+) -> "tuple[str, str, str]":
     """
-    企業・イベント情報から個別アピール段落をGeminiで生成する。
-    Returns: (paragraph, error_message)
+    企業HP等を参考に、【 】置換用の企業名・主力製品/サービス名を取得する。
+    Returns: (company_name, product_service, error_message)
     """
-    timing = company.get("event_timing", "不明")
-    event_name = company.get("event_name", "不明")
-    details = company.get("event_details", "不明")
-    mc_job = company.get("mc_job", "不明")
-    mc_scene = company.get("mc_scene", "不明")
-    company_name = company.get("name", "不明")
-    url = company.get("url", "")
+    default_name = _csv_cell(company.get("name", ""), "貴社")
+    url = _csv_cell(company.get("url", ""), "")
+    event_name = _csv_cell(company.get("event_name", ""), "不明")
+    event_details = _csv_cell(company.get("event_details", ""), "不明")
+    mc_job = _csv_cell(company.get("mc_job", ""), "不明")
 
-    prompt = f"""あなたはフリーアナウンサーの営業メール作成アシスタントです。
-以下の企業情報をもとに、営業メール本文の「個別アピール段落」だけを1段落で書いてください。
+    page_text = _scrape_company_page(url) if url and url != "不明" else ""
 
-【企業・イベント情報】
+    prompt = f"""あなたはBtoB営業メール用の企業リサーチアシスタントです。
+以下の情報とホームページ本文（あれば）から、営業メールテンプレートの【 】部分に入れる値だけを調べてください。
+
+【リスト上の情報】
 - ジャンル: {genre_label}
-- 企業名: {company_name}
+- 企業名（リスト）: {default_name}
 - 企業URL: {url}
 - イベント名: {event_name}
-- 開催時期: {timing}
-- イベント詳細: {details}
+- イベント詳細: {event_details}
 - MC業務内容: {mc_job}
-- MC想定シーン: {mc_scene}
 
-【文体ルール（厳守）】
-- ビジネス丁寧体（です・ます調）
-- 「御社」は使わず、すべて「貴社」に統一
-- 冒頭で既に「貴社のホームページを拝見し」と書くため、
-  **「貴社のHPを拝見し」「御社のHPなどを拝見し」等は絶対に書かない**
-- イベント時期・イベント名から自然に始める（例: 「毎年10月頃開催の「FIT2026（…）」に出展/開催されるとお見受けし、」）
-- 貴社の取り組み・製品・サービスに触れ、MC業務（司会・ステージ進行・登壇者紹介等）でどう役立てるかを具体的に
-- 180〜320文字程度
-- 文末は必ず「〜貢献できるのではないかと思い、ご連絡をいたしました。」で終える
-- 開催時期が不明なら「毎年〇月頃」「近日開催の」など自然な表現に
-- イベント名が不明なら「関連イベント」など自然な表現に
+【ホームページ本文（抜粋）】
+{page_text or "（取得できませんでした）"}
 
-【禁止表現】
-- 御社
-- 貴社のHP/ホームページを拝見し（重複になるため）
-- 確信しております / 自信があります / 私の強み / 必ず貢献できます
-- 面接のような自己アピール・押し付けがましい表現
+【出力形式】JSONのみ（説明不要）:
+{{
+  "company_name": "正式な企業名（例: 株式会社スカイコム）",
+  "product_service": "主力製品・サービスを自然な日本語句で（例: SkyPDF等のペーパーレスソリューション）"
+}}
 
-【参考例（トーンと構成）】
-毎年10月頃開催の「FIT2026（金融国際情報技術展）」に出展/開催されるとお見受けし、金融機関のシステム構築や業務効率化に貢献する貴社の取り組みを、セミナー司会や展示会ステージでのプレゼンテーション導入・登壇者紹介・掛け合いといったMC業務を通じて、より効果的かつ魅力的に会場の皆様へお伝えすることで、イベント全体の価値向上に貢献できるのではないかと思い、ご連絡をいたしました。
-
-【出力ルール】
-- 段落の本文のみ出力（挨拶・署名・件名は不要）
-- 箇条書き・Markdown・引用符で囲まない
+【ルール】
+- product_service は、本文「…{{product_service}}の魅力を来場者へ…」にそのまま入る短い句にする
+- 「等の」を含めてもよい（例: ○○等のペーパーレスソリューション）
+- 15〜45文字程度。末尾に「。」を付けない
+- 御社は使わない
+- リストの企業名が正しければそのまま使ってよい
+- 製品名が特定できない場合は、イベント詳細やジャンルから自然な一般表現（例: 金融向けITソリューション）にする
 """
     try:
         response = gemini_generate(model, prompt)
-        text = (response.text or "").strip()
-        text = re.sub(r"^[\"「『]+|[\"」』]+$", "", text)
-        text = _polish_personal_paragraph(text)
-        if not text:
-            return "", "AIが空の応答を返しました"
-        return text, ""
+        parsed = _extract_json(response.text or "")
+        if isinstance(parsed, dict):
+            name = _csv_cell(parsed.get("company_name", default_name), default_name)
+            product = _csv_cell(
+                parsed.get("product_service", ""),
+                "貴社のサービス・ソリューション",
+            )
+            if product in ("不明", ""):
+                product = "貴社のサービス・ソリューション"
+            return name, product, ""
+        return default_name, "貴社のサービス・ソリューション", "AI応答のJSON解析に失敗しました"
     except Exception as exc:
-        return "", str(exc)
+        if _is_quota_error(str(exc)):
+            return "", "", str(exc)
+        return default_name, "貴社のサービス・ソリューション", str(exc)
 
 
 def generate_sales_email_for_company(
@@ -2667,10 +2603,14 @@ def generate_sales_email_for_company(
     genre_label: str,
 ) -> "tuple[str, str]":
     """1社分の完成メールを生成する。Returns: (email_text, error_message)"""
-    paragraph, err = _generate_personal_paragraph(company, model, genre_label)
-    if err:
+    company_name, product_service, err = _research_email_placeholders(
+        company, model, genre_label
+    )
+    if err and _is_quota_error(err):
         return "", err
-    return _assemble_sales_email(company, paragraph), ""
+    if not company_name:
+        return "", err or "企業名を取得できませんでした"
+    return _assemble_sales_email(company_name, product_service), ""
 
 
 def run_sales_email_generation(
@@ -2703,7 +2643,7 @@ def run_sales_email_generation(
 
         status_text.markdown(
             f"**メール作成中 ({i + 1} / {total}):** {company.get('name', '不明')}　"
-            f"（Gemini生成 → {delay_seconds}秒待機）"
+            f"（HP確認 → 企業名・製品名を特定 → {delay_seconds}秒待機）"
         )
         email_text, err = generate_sales_email_for_company(company, model, genre_label)
 
@@ -2763,7 +2703,7 @@ def render_step5(cfg: dict) -> None:
     st.header("✉️ STEP 5 ― 営業メール生成（ZIPダウンロード）")
     st.info(
         "STEP3/4 で絞り込んだ企業リスト、または **CSV復元** したリストをもとに、"
-        "各社宛ての営業メールをAIで作成します。\n\n"
+        "固定テンプレートの【 】部分（企業名・主力製品/サービス）だけをAIが置き換えます。\n\n"
         "完成後は **ジャンル/企業名/営業メール.txt** 形式のZIPを **1回** ダウンロードできます。"
     )
 
@@ -2809,7 +2749,7 @@ def render_step5(cfg: dict) -> None:
     )
     st.caption(
         f"ジャンル: **{_genre_to_sheet_tab(genre_label)}** ／ "
-        f"件名: **{SALES_EMAIL_SUBJECT}** ／ 宛名: 会社名 + イベント企画ご担当者様"
+        f"件名: **{SALES_EMAIL_SUBJECT}** ／ 宛名: 会社名 + イベント・セミナーご担当者様"
     )
 
     if remaining > 0:
