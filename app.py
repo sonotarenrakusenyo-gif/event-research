@@ -82,15 +82,7 @@ OUTPUT_COLUMNS = [
     "企業名",
     "企業のHP URL",
     "連絡先（代表メールや問い合わせ窓口）",
-    "担当者肩書",
-    "担当者名",
-    "イベント開催時期",
     "開催会場",
-    "イベント形式",
-    "ジャンルや特徴・詳細",
-    "ステージの種類・MC業務内容",
-    "MCの想定シーン",
-    "情報ソース",
     "書き込み日時",
 ]
 
@@ -623,15 +615,7 @@ def _csv_row_to_company(row: pd.Series) -> dict:
         "name": _csv_cell(row.get("企業名", ""), ""),
         "url": _csv_cell(row.get("企業のHP URL", ""), ""),
         "contact": _csv_cell(row.get("連絡先（代表メールや問い合わせ窓口）", "不明")),
-        "contact_title": _csv_cell(row.get("担当者肩書", "不明")),
-        "contact_name": _csv_cell(row.get("担当者名", "不明")),
-        "event_timing": _csv_cell(row.get("イベント開催時期", "不明")),
         "event_venue": _csv_cell(row.get("開催会場", "不明")),
-        "event_format": _csv_cell(row.get("イベント形式", "不明")),
-        "event_details": _csv_cell(row.get("ジャンルや特徴・詳細", "不明")),
-        "mc_job": _csv_cell(row.get("ステージの種類・MC業務内容", "不明")),
-        "mc_scene": _csv_cell(row.get("MCの想定シーン", "不明")),
-        "source": _csv_cell(row.get("情報ソース", ""), ""),
     }
 
 
@@ -1498,14 +1482,7 @@ URL: {company.get("url", "不明")}
 
 【抽出項目】（不明・取得不可の場合は必ず "不明" と記入）
 - contact: 代表メール or 問い合わせフォームURL（1件）
-- contact_title: 担当者の肩書
-- contact_name: 担当者の名前
-- event_timing: 主なイベント開催時期（例: 毎年3月・10月、不定期）
 - event_venue: 主な開催会場（例: 東京ビッグサイト、TKP渋谷、自社セミナールーム、YouTube）
-- event_format: イベント形式（例: 屋内、オンライン、ハイブリッド）
-- event_details: ジャンルや特徴・詳細（100文字以内）
-- mc_job: ステージの種類・MC業務内容（例: トークショー司会、プレゼン前振り後振り、掛け合い、暗記あり/なし）
-- mc_scene: MCの想定シーン（例: メインステージ、オープニングセレモニー、ウェビナー冒頭）
 
 【必須出力JSONフォーマット】
 {{
@@ -1514,14 +1491,7 @@ URL: {company.get("url", "不明")}
   "exclusion_risk": false,
   "exclusion_reason": "",
   "contact": "不明",
-  "contact_title": "不明",
-  "contact_name": "不明",
-  "event_timing": "不明",
-  "event_venue": "不明",
-  "event_format": "不明",
-  "event_details": "不明",
-  "mc_job": "不明",
-  "mc_scene": "不明"
+  "event_venue": "不明"
 }}
 """
 
@@ -1532,7 +1502,7 @@ def classify_company(
     genre_label: str,
 ) -> dict:
     """
-    Gemini API で1社ずつ判定し、13項目すべてを含む辞書を返す。
+    Gemini API で1社ずつ判定し、連絡先・開催会場を含む辞書を返す。
     取得できなかった項目は "不明" で埋める。
     """
     page_text = _scrape_company_page(company.get("url", ""))
@@ -1540,9 +1510,7 @@ def classify_company(
     fallback: dict = {
         "tokyo_area": False, "mc_related": False,
         "exclusion_risk": False, "exclusion_reason": "",
-        "contact": "不明", "contact_title": "不明", "contact_name": "不明",
-        "event_timing": "不明", "event_venue": "不明", "event_format": "不明",
-        "event_details": "不明", "mc_job": "不明", "mc_scene": "不明",
+        "contact": "不明", "event_venue": "不明",
     }
 
     try:
@@ -1551,14 +1519,13 @@ def classify_company(
         parsed = _extract_json(response.text.strip())
 
         if not isinstance(parsed, dict):
-            fallback["event_details"] = "JSONパース失敗"
+            fallback["_parse_error"] = "JSONパース失敗"
             return {**company, **fallback}
 
         merged = {**fallback, **{k: v for k, v in parsed.items() if v is not None}}
         return {**company, **merged}
 
     except Exception as exc:
-        fallback["event_details"] = f"APIエラー: {exc}"
         fallback["_api_error"] = str(exc)
         return {**company, **fallback}
 
@@ -1648,15 +1615,7 @@ def _build_csv_dataframe(companies: list[dict]) -> pd.DataFrame:
             "企業名":                         c.get("name", "不明"),
             "企業のHP URL":                   c.get("url", "不明"),
             "連絡先（代表メールや問い合わせ窓口）": c.get("contact", "不明"),
-            "担当者肩書":                     c.get("contact_title", "不明"),
-            "担当者名":                       c.get("contact_name", "不明"),
-            "イベント開催時期":               c.get("event_timing", "不明"),
             "開催会場":                       c.get("event_venue", "不明"),
-            "イベント形式":                   c.get("event_format", "不明"),
-            "ジャンルや特徴・詳細":           c.get("event_details", "不明"),
-            "ステージの種類・MC業務内容":      c.get("mc_job", "不明"),
-            "MCの想定シーン":                 c.get("mc_scene", "不明"),
-            "情報ソース":                     c.get("source", ""),
             "書き込み日時":                   now_str,
         })
     df = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
@@ -1701,15 +1660,7 @@ def export_to_google_sheets(
                 c.get("name", ""),
                 c.get("url", ""),
                 c.get("contact", "不明"),
-                c.get("contact_title", "不明"),
-                c.get("contact_name", "不明"),
-                c.get("event_timing", "不明"),
                 c.get("event_venue", "不明"),
-                c.get("event_format", "不明"),
-                c.get("event_details", "不明"),
-                c.get("mc_job", "不明"),
-                c.get("mc_scene", "不明"),
-                c.get("source", ""),
                 now_str,
             ]
             for c in companies
@@ -2249,7 +2200,7 @@ def render_step3(cfg: dict) -> None:
         f"① 東京都内・近郊エリアの企業かどうか\n"
         f"② MC・ナレーターを必要とするイベント開催実績があるか\n"
         f"③ エル・アミティエ / フェアリィと深い関係がある企業でないか\n"
-        f"④ 13項目の営業情報を同時抽出\n\n"
+        f"④ 連絡先・開催会場を同時抽出\n\n"
         f"⏱️ 残りの予想所要時間: 約 **{estimated_sec // 60} 分 {estimated_sec % 60} 秒**"
         f"（{cfg['delay_seconds']} 秒間隔）\n\n"
         f"💡 途中で止まっても、もう一度ボタンを押せば**続きから再開**します"
@@ -2353,8 +2304,8 @@ def render_step3(cfg: dict) -> None:
             "name": "企業名", "url": "URL",
             "event_name": "関連イベント",
             "判定ステータス": "判定ステータス",
-            "event_venue": "開催会場", "event_format": "形式",
-            "mc_job": "MC業務内容",
+            "contact": "連絡先",
+            "event_venue": "開催会場",
         }
         show = [c for c in col_map if c in all_df.columns or c == "判定ステータス"]
         st.dataframe(
@@ -2362,7 +2313,7 @@ def render_step3(cfg: dict) -> None:
             use_container_width=True, hide_index=True,
         )
 
-    # ---- 最終結果（13項目） ----
+    # ---- 最終結果 ----
     if st.session_state.filtered_companies:
         st.subheader(f"✅ 最終絞り込み結果（{len(st.session_state.filtered_companies)} 社）")
         final_df = pd.DataFrame(st.session_state.filtered_companies)
@@ -2371,14 +2322,7 @@ def render_step3(cfg: dict) -> None:
             "event_name": "イベント名",
             "name": "企業名", "url": "企業URL",
             "contact": "連絡先",
-            "contact_title": "担当者肩書",
-            "contact_name": "担当者名",
-            "event_timing": "開催時期",
             "event_venue": "開催会場",
-            "event_format": "形式",
-            "event_details": "詳細",
-            "mc_job": "MC業務内容",
-            "mc_scene": "MCシーン",
         }
         show2 = [c for c in col_map2 if c in final_df.columns]
         st.dataframe(
@@ -2403,7 +2347,7 @@ def render_step4(cfg: dict) -> None:
     st.success(f"**{len(companies)} 社**の営業リストが完成しました")
     st.caption("➡️ スプレッドシートに既にある場合は **STEP4 をスキップ** して **STEP5** へ進めます")
 
-    with st.expander("📋 出力データのプレビュー（全15列）"):
+    with st.expander("📋 出力データのプレビュー（全7列）"):
         st.dataframe(_build_csv_dataframe(companies), use_container_width=True, hide_index=True)
 
     st.divider()
@@ -2550,8 +2494,6 @@ def _research_email_placeholders(
     default_name = _csv_cell(company.get("name", ""), "貴社")
     url = _csv_cell(company.get("url", ""), "")
     event_name = _csv_cell(company.get("event_name", ""), "不明")
-    event_details = _csv_cell(company.get("event_details", ""), "不明")
-    mc_job = _csv_cell(company.get("mc_job", ""), "不明")
 
     page_text = (
         _scrape_company_page(url, max_chars=4000)
@@ -2567,8 +2509,6 @@ def _research_email_placeholders(
 - 企業名（リスト）: {default_name}
 - 企業URL: {url}
 - イベント名: {event_name}
-- イベント詳細: {event_details}
-- MC業務内容: {mc_job}
 
 【ホームページ本文（product_service の唯一の根拠）】
 {page_text or "（取得できませんでした）"}
