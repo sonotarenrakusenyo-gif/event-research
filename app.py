@@ -81,9 +81,9 @@ OUTPUT_COLUMNS = [
     "AIが自動リサーチしたイベント名",
     "企業名",
     "企業のHP URL",
-    "連絡先（代表メールや問い合わせ窓口）",
+    "お問い合わせフォームURL",
+    "イベント開催時期",
     "開催会場",
-    "書き込み日時",
 ]
 
 MAX_SEARCH_RESULTS_PER_QUERY = 20
@@ -607,6 +607,14 @@ def _csv_cell(value, default: str = "不明") -> str:
     return text
 
 
+def _company_contact_form_url(company: dict) -> str:
+    """お問い合わせフォームURL（旧 contact 列との互換あり）。"""
+    return _csv_cell(
+        company.get("contact_form_url") or company.get("contact", ""),
+        "不明",
+    )
+
+
 def _csv_row_to_company(row: pd.Series) -> dict:
     """CSVの1行を filtered_companies 用の dict に変換する。"""
     return {
@@ -614,7 +622,13 @@ def _csv_row_to_company(row: pd.Series) -> dict:
         "event_name": _csv_cell(row.get("AIが自動リサーチしたイベント名", "不明")),
         "name": _csv_cell(row.get("企業名", ""), ""),
         "url": _csv_cell(row.get("企業のHP URL", ""), ""),
-        "contact": _csv_cell(row.get("連絡先（代表メールや問い合わせ窓口）", "不明")),
+        "contact_form_url": _csv_cell(
+            row.get("お問い合わせフォームURL")
+            if pd.notna(row.get("お問い合わせフォームURL"))
+            else row.get("連絡先（代表メールや問い合わせ窓口）", "不明"),
+            "不明",
+        ),
+        "event_timing": _csv_cell(row.get("イベント開催時期", "不明")),
         "event_venue": _csv_cell(row.get("開催会場", "不明")),
     }
 
@@ -1481,8 +1495,19 @@ URL: {company.get("url", "不明")}
 広告代理店・イベント制作会社と判断できる場合 true
 
 【抽出項目】（不明・取得不可の場合は必ず "不明" と記入）
-- contact: 代表メール or 問い合わせフォームURL（1件）
-- event_venue: 主な開催会場（例: 東京ビッグサイト、TKP渋谷、自社セミナールーム、YouTube）
+
+■ contact_form_url（お問い合わせフォームURL）【最重要・ホームページURLと混同禁止】
+- **企業HP URL（上記 URL）とは別ページ** の、お問い合わせ・問い合わせフォーム専用ページのURL
+- ユーザーが氏名・メール・問い合わせ内容などを**入力して送信するフォーム**があるページ
+- 典型例: https://www.nikkin.co.jp/contact.html（トップ https://www.nikkin.co.jp/ とは別URL）
+- よくあるパス: /contact, /contact.html, /inquiry, /form, /toiawase, /support/contact など
+- **禁止**: 企業HP URL（トップページ）を contact_form_url に入れること
+- **禁止**: メールアドレス（mailto:）だけを入れること
+- HP内リンク・サイトマップ・フッターの「お問い合わせ」リンクから特定する
+- フォームページが見つからない場合のみ "不明"
+
+■ event_timing: 主なイベント開催時期（例: 毎年3月・10月、2026年9月、不定期）
+■ event_venue: 主な開催会場（例: 東京ビッグサイト、TKP渋谷、自社セミナールーム、YouTube）
 
 【必須出力JSONフォーマット】
 {{
@@ -1490,10 +1515,49 @@ URL: {company.get("url", "不明")}
   "mc_related": true,
   "exclusion_risk": false,
   "exclusion_reason": "",
-  "contact": "不明",
+  "contact_form_url": "不明",
+  "event_timing": "不明",
   "event_venue": "不明"
 }}
 """
+
+
+def _normalize_url_for_compare(url: str) -> str:
+    """URL比較用に正規化する（末尾スラッシュ・www を揃える）。"""
+    u = (url or "").strip().lower()
+    for prefix in ("https://", "http://"):
+        if u.startswith(prefix):
+            u = u[len(prefix):]
+            break
+    if u.startswith("www."):
+        u = u[4:]
+    return u.rstrip("/")
+
+
+def _sanitize_contact_form_url(contact_url: str, homepage_url: str) -> str:
+    """
+    お問い合わせフォームURLを検証する。
+    ホームページURL・mailto・空欄は「不明」にする。
+    """
+    raw = _csv_cell(contact_url, "")
+    if raw in ("", "不明"):
+        return "不明"
+    if raw.lower().startswith("mailto:"):
+        return "不明"
+
+    home = _normalize_url_for_compare(homepage_url)
+    contact = _normalize_url_for_compare(raw)
+    if not contact:
+        return "不明"
+    if home and contact == home:
+        return "不明"
+    # トップのみ（パスなし）でHPと同一ドメインの場合も除外
+    if home and contact.split("/", 1)[0] == home.split("/", 1)[0]:
+        contact_path = contact.split("/", 1)[1] if "/" in contact else ""
+        if not contact_path or contact_path in ("index.html", "index.htm", "index.php"):
+            return "不明"
+
+    return raw
 
 
 def classify_company(
@@ -1502,7 +1566,7 @@ def classify_company(
     genre_label: str,
 ) -> dict:
     """
-    Gemini API で1社ずつ判定し、連絡先・開催会場を含む辞書を返す。
+    Gemini API で1社ずつ判定し、お問い合わせフォームURL・開催時期・開催会場を含む辞書を返す。
     取得できなかった項目は "不明" で埋める。
     """
     page_text = _scrape_company_page(company.get("url", ""))
@@ -1510,7 +1574,9 @@ def classify_company(
     fallback: dict = {
         "tokyo_area": False, "mc_related": False,
         "exclusion_risk": False, "exclusion_reason": "",
-        "contact": "不明", "event_venue": "不明",
+        "contact_form_url": "不明",
+        "event_timing": "不明",
+        "event_venue": "不明",
     }
 
     try:
@@ -1523,6 +1589,12 @@ def classify_company(
             return {**company, **fallback}
 
         merged = {**fallback, **{k: v for k, v in parsed.items() if v is not None}}
+        if merged.get("contact_form_url") in ("不明", "", None) and parsed.get("contact"):
+            merged["contact_form_url"] = parsed["contact"]
+        merged["contact_form_url"] = _sanitize_contact_form_url(
+            merged.get("contact_form_url", "不明"),
+            company.get("url", ""),
+        )
         return {**company, **merged}
 
     except Exception as exc:
@@ -1606,7 +1678,6 @@ def _build_csv_dataframe(companies: list[dict]) -> pd.DataFrame:
     OUTPUT_COLUMNS の順番通りの DataFrame を生成する。
     欠損値はすべて「不明」で埋める。
     """
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     rows = []
     for c in companies:
         rows.append({
@@ -1614,9 +1685,9 @@ def _build_csv_dataframe(companies: list[dict]) -> pd.DataFrame:
             "AIが自動リサーチしたイベント名":  c.get("event_name", "不明"),
             "企業名":                         c.get("name", "不明"),
             "企業のHP URL":                   c.get("url", "不明"),
-            "連絡先（代表メールや問い合わせ窓口）": c.get("contact", "不明"),
+            "お問い合わせフォームURL":         _company_contact_form_url(c),
+            "イベント開催時期":               c.get("event_timing", "不明"),
             "開催会場":                       c.get("event_venue", "不明"),
-            "書き込み日時":                   now_str,
         })
     df = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
     return df.fillna("不明")
@@ -1652,16 +1723,15 @@ def export_to_google_sheets(
         if not sheet.get_all_values():
             sheet.append_row(OUTPUT_COLUMNS, value_input_option="USER_ENTERED")
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         rows = [
             [
                 c.get("genre_label", "不明"),
                 c.get("event_name", "不明"),
                 c.get("name", ""),
                 c.get("url", ""),
-                c.get("contact", "不明"),
+                _company_contact_form_url(c),
+                c.get("event_timing", "不明"),
                 c.get("event_venue", "不明"),
-                now_str,
             ]
             for c in companies
         ]
@@ -2200,7 +2270,7 @@ def render_step3(cfg: dict) -> None:
         f"① 東京都内・近郊エリアの企業かどうか\n"
         f"② MC・ナレーターを必要とするイベント開催実績があるか\n"
         f"③ エル・アミティエ / フェアリィと深い関係がある企業でないか\n"
-        f"④ 連絡先・開催会場を同時抽出\n\n"
+        f"④ お問い合わせフォームURL・開催時期・開催会場を同時抽出\n\n"
         f"⏱️ 残りの予想所要時間: 約 **{estimated_sec // 60} 分 {estimated_sec % 60} 秒**"
         f"（{cfg['delay_seconds']} 秒間隔）\n\n"
         f"💡 途中で止まっても、もう一度ボタンを押せば**続きから再開**します"
@@ -2304,7 +2374,8 @@ def render_step3(cfg: dict) -> None:
             "name": "企業名", "url": "URL",
             "event_name": "関連イベント",
             "判定ステータス": "判定ステータス",
-            "contact": "連絡先",
+            "contact_form_url": "お問い合わせフォーム",
+            "event_timing": "開催時期",
             "event_venue": "開催会場",
         }
         show = [c for c in col_map if c in all_df.columns or c == "判定ステータス"]
@@ -2321,7 +2392,8 @@ def render_step3(cfg: dict) -> None:
             "genre_label": "ジャンル",
             "event_name": "イベント名",
             "name": "企業名", "url": "企業URL",
-            "contact": "連絡先",
+            "contact_form_url": "お問い合わせフォーム",
+            "event_timing": "開催時期",
             "event_venue": "開催会場",
         }
         show2 = [c for c in col_map2 if c in final_df.columns]
