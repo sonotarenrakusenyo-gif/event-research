@@ -2000,6 +2000,24 @@ def render_sidebar() -> dict:
 # STEP1 タブ: 完全自動イベントリサーチ
 # ============================================================
 
+def _event_option_label(event: dict) -> str:
+    """イベント選択プルダウン用の表示ラベル。"""
+    name = event.get("name", "不明")
+    timing = event.get("timing", "不明")
+    venue = event.get("venue", "不明")
+    return f"{name}（{timing} / {venue}）"
+
+
+def _select_event_for_step2(event: dict) -> None:
+    """STEP2 用にイベントを確定し、後続データをリセットして保存する。"""
+    st.session_state.selected_event = event
+    st.session_state.companies = []
+    st.session_state.excluded_companies = []
+    st.session_state.ai_results = []
+    st.session_state.filtered_companies = []
+    save_state()
+
+
 def render_step1(cfg: dict) -> None:
     st.header("🔍 STEP 1 ― ジャンル選択 → 完全自動イベントリサーチ")
     st.info(
@@ -2102,37 +2120,60 @@ def render_step1(cfg: dict) -> None:
     # ③ イベント一覧の表示・選択
     if st.session_state.events:
         st.subheader(f"📋 自動リサーチ結果（{len(st.session_state.events)} 件）")
-        st.caption("👇 営業対象にしたいイベントを選択して STEP2 に進んでください")
 
-        for i, event in enumerate(st.session_state.events):
+        events = st.session_state.events
+        selected = st.session_state.get("selected_event")
+
+        if selected:
+            st.success(
+                f"✅ **選択中:** {selected.get('name', '不明')}　"
+                "→ 画面上部の **「🏢 STEP2: 企業収集」** タブを開いてください"
+            )
+
+        event_labels = [_event_option_label(e) for e in events]
+        picked_idx = 0
+        if selected:
+            for idx, event in enumerate(events):
+                if (
+                    event.get("url") == selected.get("url")
+                    and event.get("name") == selected.get("name")
+                ):
+                    picked_idx = idx
+                    break
+
+        st.caption("👇 リストからイベントを選び、下のボタンで STEP2 に進んでください")
+        chosen_idx = st.selectbox(
+            "📌 営業対象にするイベント",
+            options=list(range(len(events))),
+            format_func=lambda i: event_labels[i],
+            index=picked_idx,
+            key="step1_event_picker",
+        )
+
+        if st.button(
+            "✅ このイベントを選択して STEP2 へ進む",
+            type="primary",
+            use_container_width=True,
+            key="step1_confirm_event",
+        ):
+            _select_event_for_step2(events[chosen_idx])
+            st.rerun()
+
+        st.divider()
+        st.caption("各イベントの詳細")
+        for i, event in enumerate(events):
             with st.expander(
                 f"📌 {event.get('name', '不明')}",
-                expanded=(i == 0),
+                expanded=(i == chosen_idx),
             ):
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.markdown(f"**URL:** [{event.get('url', '')}]({event.get('url', '')})")
-                    st.markdown(f"**会場:** {event.get('venue', '不明')}　"
-                                f"**時期:** {event.get('timing', '不明')}　"
-                                f"**形式:** {event.get('format', '不明')}")
-                    if event.get("snippet"):
-                        st.caption(event["snippet"])
-                with col2:
-                    if st.button(
-                        "このイベントを選択\n→ STEP2へ",
-                        key=f"select_event_{i}",
-                        type="secondary",
-                        use_container_width=True,
-                    ):
-                        st.session_state.selected_event = event
-                        st.session_state.companies = []
-                        st.session_state.excluded_companies = []
-                        st.session_state.ai_results = []
-                        st.session_state.filtered_companies = []
-                        st.success(
-                            f"「{event.get('name', '不明')}」を選択しました。"
-                            f"STEP2 タブに進んでください。"
-                        )
+                st.markdown(f"**URL:** [{event.get('url', '')}]({event.get('url', '')})")
+                st.markdown(
+                    f"**会場:** {event.get('venue', '不明')}　"
+                    f"**時期:** {event.get('timing', '不明')}　"
+                    f"**形式:** {event.get('format', '不明')}"
+                )
+                if event.get("snippet"):
+                    st.caption(event["snippet"])
 
 
 # ============================================================
