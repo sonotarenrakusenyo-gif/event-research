@@ -470,21 +470,56 @@ def _genre_to_sheet_tab(genre_label: str) -> str:
     return (name[:100] if name else "営業リスト")
 
 
+def _split_custom_genre_terms(text: str) -> list[str]:
+    """自由入力を複数ジャンル語に分割する（カンマ・読点・スラッシュ対応）。"""
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    terms: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,、/／]+", raw):
+        term = part.strip()
+        if term and term not in seen:
+            seen.add(term)
+            terms.append(term)
+    return terms
+
+
+def _keywords_for_custom_term(word: str) -> list[str]:
+    """自由入力の1語から検索キーワード候補を生成する。"""
+    return [
+        f"{word} グルメフェス",
+        f"{word} フードフェス",
+        f"{word} マルシェ",
+        f"{word} イベント",
+        f"{word} 展示会",
+        f"{word} 試食会",
+        f"{word} セミナー",
+    ]
+
+
+def _merge_custom_term_keywords(terms: list[str]) -> list[str]:
+    """複数語のキーワードを語ごとに均等に検索へ回すよう交互に並べる。"""
+    per_term = [_keywords_for_custom_term(term) for term in terms]
+    merged: list[str] = []
+    seen: set[str] = set()
+    max_len = max(len(kws) for kws in per_term)
+    for i in range(max_len):
+        for kws in per_term:
+            if i < len(kws) and kws[i] not in seen:
+                seen.add(kws[i])
+                merged.append(kws[i])
+    return merged
+
+
 def _custom_genre_from_input(text: str) -> dict:
-    """自由入力テキストから検索用ジャンル情報を生成する。"""
-    word = text.strip()
-    return {
-        "label": word,
-        "keywords": [
-            f"{word} グルメフェス",
-            f"{word} フードフェス",
-            f"{word} マルシェ",
-            f"{word} イベント",
-            f"{word} 展示会",
-            f"{word} 試食会",
-            f"{word} セミナー",
-        ],
-    }
+    """自由入力テキストから検索用ジャンル情報を生成する（複数語はそれぞれ反映）。"""
+    terms = _split_custom_genre_terms(text)
+    if not terms:
+        return {"label": "", "keywords": []}
+
+    label = "・".join(terms) if len(terms) > 1 else terms[0]
+    return {"label": label, "keywords": _merge_custom_term_keywords(terms)}
 
 
 def _event_search_type_suffix(search_mode: str) -> str:
@@ -535,7 +570,8 @@ def _resolve_search_genre(
     """
     custom = (custom_input or "").strip()
     if custom:
-        return _custom_genre_from_input(custom), custom
+        genre = _custom_genre_from_input(custom)
+        return genre, genre["label"] or custom
 
     if selected_label != "― ジャンルを選択してください ―":
         genre = next((g for g in GENRE_LIST if g["label"] == selected_label), None)
@@ -2173,7 +2209,7 @@ def _confirm_step1_event() -> None:
 def render_step1(cfg: dict) -> None:
     st.header("🔍 STEP 1 ― ジャンル選択 → 完全自動イベントリサーチ")
     st.info(
-        "50カテゴリから選ぶか、自由入力欄にジャンル名（例: 食べ物）を入れて\n"
+        "50カテゴリから選ぶか、自由入力欄にジャンル名（例: スイーツ、デザート）を入れて\n"
         "「自動リサーチ開始」を押すと、GoogleとGeminiが連動して\n"
         "東京都内・近郊で開催されるイベントを**全自動でリサーチ**します。"
     )
@@ -2193,8 +2229,12 @@ def render_step1(cfg: dict) -> None:
     # ② 自由入力ジャンル（任意・入力時はこちらを優先）
     custom_genre_input = st.text_input(
         "✏️ 自由入力ジャンル（任意）",
-        placeholder="例: 食べ物 / グルメ / eスポーツ / 防災",
-        help="カテゴリ一覧にないジャンルを調べたいときに入力。入力するとプルダウンより優先されます",
+        placeholder="例: スイーツ、デザート、お菓子（カンマ区切りで複数可）",
+        help=(
+            "カテゴリ一覧にないジャンルを調べたいときに入力。"
+            "カンマ・読点・スラッシュで区切ると、それぞれ別キーワードとして検索に反映されます。"
+            "入力するとプルダウンより優先されます"
+        ),
     )
 
     using_custom = bool((custom_genre_input or "").strip())
