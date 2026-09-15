@@ -133,9 +133,8 @@ GENRE_LIST: list[dict] = [
                      "マテハン 展示会", "倉庫管理 自動搬送 展示会", "梱包 展示会"],
     },
     {
-        "label": "9. 食品・飲料・醸造",
-        "keywords": ["食品 展示会", "飲料 醸造 展示会",
-                     "食材 食品加工 展示会", "食品衛生 パッケージ 展示会"],
+        "label": "9. 食品・飲料",
+        "keywords": ["食品 展示会", "グルメフェス", "フードフェス", "食品 マルシェ"],
     },
     {
         "label": "10. 外食・フードサービス・店舗運営",
@@ -344,6 +343,65 @@ GENRE_LIST: list[dict] = [
     },
 ]
 
+SEARCH_MODE_EXPO = "expo"
+SEARCH_MODE_GOURMET = "gourmet_sme"
+SEARCH_MODE_LABELS: dict[str, str] = {
+    SEARCH_MODE_EXPO: "展示会・見本市中心",
+    SEARCH_MODE_GOURMET: "グルメ・中小イベント中心",
+}
+
+FOOD_SUBTOPICS: tuple[str, ...] = ("食品", "飲料")
+
+GENRE_TOPIC_KEYWORD_OVERRIDES: dict[str, list[str]] = {
+    "食品": [
+        "食品 展示会", "グルメフェス", "フードフェス", "食品 マルシェ",
+        "フードマルシェ", "試食イベント", "食材 見本市", "惣菜 イベント",
+        "スイーツ フェス", "加工食品 イベント", "食品 物産展", "食べ物 イベント",
+        "地域グルメ イベント", "食品 試食会", "キッチンカー イベント",
+    ],
+    "飲料": [
+        "ノンアルコール 飲料 イベント", "ソフトドリンク 展示会",
+        "コーヒー イベント", "紅茶 セミナー", "ジュース ブランド イベント",
+        "ティー フェス", "ミネラルウォーター 展示会", "健康飲料 イベント",
+    ],
+}
+
+
+def _default_keywords_for_topic(topic: str) -> list[str]:
+    """単独ジャンル用の検索キーワード候補。"""
+    if topic in GENRE_TOPIC_KEYWORD_OVERRIDES:
+        return GENRE_TOPIC_KEYWORD_OVERRIDES[topic]
+    return [
+        f"{topic} 展示会",
+        f"{topic} イベント",
+        f"{topic} フェス",
+        f"{topic} マルシェ",
+        f"{topic} セミナー",
+    ]
+
+
+def _is_food_category_label(label: str) -> bool:
+    """「9. 食品・飲料」カテゴリかどうか。"""
+    return bool(re.match(r"^9\.\s*食品", (label or "").strip()))
+
+
+def _merge_food_subtopic_keywords(topics: list[str]) -> list[str]:
+    """食品サブカテゴリ複数選択時にキーワードを統合する。"""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for topic in topics:
+        if topic not in FOOD_SUBTOPICS:
+            continue
+        kws = GENRE_TOPIC_KEYWORD_OVERRIDES.get(
+            topic, _default_keywords_for_topic(topic)
+        )
+        for kw in kws:
+            if kw not in seen:
+                seen.add(kw)
+                merged.append(kw)
+    return merged
+
+
 GENRE_LABELS: list[str] = ["― ジャンルを選択してください ―"] + [g["label"] for g in GENRE_LIST]
 
 
@@ -418,22 +476,62 @@ def _custom_genre_from_input(text: str) -> dict:
     return {
         "label": word,
         "keywords": [
-            f"{word} 展示会",
+            f"{word} グルメフェス",
+            f"{word} フードフェス",
+            f"{word} マルシェ",
             f"{word} イベント",
-            f"{word} カンファレンス",
+            f"{word} 展示会",
+            f"{word} 試食会",
             f"{word} セミナー",
-            f"{word} EXPO",
         ],
     }
+
+
+def _event_search_type_suffix(search_mode: str) -> str:
+    """検索モードに応じたイベント種別のOR句。"""
+    if search_mode == SEARCH_MODE_GOURMET:
+        return (
+            "グルメフェス OR フードフェス OR マルシェ OR 試食会 OR 物産展 "
+            "OR フードイベント OR キッチンカー OR 商店街 OR 食フェス OR イベント"
+        )
+    return "展示会 OR セミナー OR 講演会 OR カンファレンス OR 自社イベント"
+
+
+def _gemini_event_mode_instructions(search_mode: str) -> str:
+    """Geminiイベント整理用のモード別指示。"""
+    if search_mode == SEARCH_MODE_GOURMET:
+        return """
+【検索モード: グルメ・中小イベント中心】
+- 東京ビッグサイト・幕張メッセ等の巨大B2B展示会に加え、グルメフェス・マルシェ・物産展・試食イベント・商店街イベント・定期開催の食イベントを積極的に含める
+- 中小企業・個人店・地域ブランド・飲食店が出店・出展しやすいイベントを優先する
+- TKP・コミュニティ会場・駅前・商店街など、小規模会場のイベントも優先する
+- 大手メーカー向け巨大展示会のみのイベントは優先度を下げる（完全除外はしない）
+"""
+    return """
+【検索モード: 展示会・見本市中心】
+- 展示会・見本市・博覧会・業界向け大型イベントを優先する
+"""
+
+
+def _gemini_sme_company_instructions() -> str:
+    """企業抽出時の中小優先指示（大手除外はしない）。"""
+    return """
+【中小企業優先（大手は除外しない）】
+- 出展・出店リストから、中小企業・個人店・地域ブランド・ベンチャーを優先して拾う
+- 知識から補う場合も、大手有名ブランドより中小・個人経営の実在企業を優先する
+- 上場大手・超大手もリストに含めてよい（除外しない）が、可能なら中小を多めに列挙する
+"""
 
 
 def _resolve_search_genre(
     selected_label: str,
     custom_input: str,
+    food_subtopics: "list[str] | None" = None,
 ) -> "tuple[dict | None, str]":
     """
     プルダウンまたは自由入力から検索に使うジャンルを決定する。
     自由入力がある場合はそちらを優先する。
+    「9. 食品・飲料」選択時は food_subtopics の複数選択でキーワードを合成する。
     """
     custom = (custom_input or "").strip()
     if custom:
@@ -442,6 +540,13 @@ def _resolve_search_genre(
     if selected_label != "― ジャンルを選択してください ―":
         genre = next((g for g in GENRE_LIST if g["label"] == selected_label), None)
         if genre:
+            if _is_food_category_label(selected_label):
+                topics = [t for t in (food_subtopics or []) if t in FOOD_SUBTOPICS]
+                if not topics:
+                    return None, ""
+                keywords = _merge_food_subtopic_keywords(topics)
+                active = "食品・飲料（" + "・".join(topics) + "）"
+                return {"label": active, "keywords": keywords}, active
             return genre, selected_label
     return None, ""
 
@@ -863,6 +968,7 @@ def auto_research_events(
     serpapi_key: str,
     max_queries: int = 3,
     target_years: "list[int] | None" = None,
+    search_mode: str = SEARCH_MODE_EXPO,
 ) -> list[dict]:
     """
     選択ジャンルのキーワードを使ってSerpAPI（Google検索）で検索し、
@@ -885,11 +991,12 @@ def auto_research_events(
 
     keywords = genre.get("keywords", [])[:max_queries]
 
+    type_suffix = _event_search_type_suffix(search_mode)
     for kw in keywords:
-        # 東京近郊 + 展示会/セミナー/講演会 + 対象年 を付加して絞り込む
+        # 東京近郊 + イベント種別 + 対象年 を付加して絞り込む
         query = (
             f"{kw} 東京 OR 幕張 OR 横浜 OR 川崎 OR さいたま OR 千葉 "
-            f"展示会 OR セミナー OR 講演会 OR カンファレンス OR 自社イベント "
+            f"{type_suffix} "
             f"{year_part}"
         )
         results = _serpapi_search(query, serpapi_key, MAX_SEARCH_RESULTS_PER_QUERY)
@@ -949,6 +1056,7 @@ def validate_events_with_gemini(
     genre_label: str,
     gemini_api_key: str,
     target_years: "list[int] | None" = None,
+    search_mode: str = SEARCH_MODE_EXPO,
 ) -> list[dict]:
     """
     Google検索で得たイベント候補をGeminiに一括送信し、
@@ -990,6 +1098,7 @@ def validate_events_with_gemini(
 - 同種のイベントが複数あればできるだけ多く列挙する（最大40件まで）
 - MCやナレーターが活躍するステージ・ブース・司会進行がありそうなイベントを優先
 - エル・アミティエ・フェアリィが関わっていてもイベント段階では除外しない
+{_gemini_event_mode_instructions(search_mode)}
 
 【回答形式】JSONの配列のみ出力（他の文章は不要）:
 [
@@ -1293,6 +1402,7 @@ def extract_companies_with_gemini(
 2. それだけで少ない場合は、このイベント・ジャンル（{genre_label}）に
    実際に出展・協賛しそうな【実在する日本企業】をあなたの知識から補う
    （※存在しない企業を創作することは絶対に禁止。実在が確実な企業のみ）
+{_gemini_sme_company_instructions()}
 
 【厳守する除外ルール】
 - 企業（法人・事業者）のみを出力する
@@ -1902,6 +2012,15 @@ def render_sidebar() -> dict:
         )
 
         st.subheader("🔍 イベント検索設定")
+        search_mode = st.radio(
+            "イベント検索モード",
+            options=[SEARCH_MODE_EXPO, SEARCH_MODE_GOURMET],
+            format_func=lambda k: SEARCH_MODE_LABELS[k],
+            index=0,
+            horizontal=True,
+            help="グルメ・中小モードはマルシェやフードフェスなども拾いやすくなります",
+            key="event_search_mode",
+        )
         max_queries = st.slider(
             "ジャンルキーワードの使用数",
             min_value=1, max_value=5, value=5,
@@ -1992,6 +2111,7 @@ def render_sidebar() -> dict:
         "delay_seconds": delay_seconds,
         "max_queries": max_queries,
         "target_years": target_years,
+        "search_mode": search_mode,
         "additional_exclusions": additional_exclusions,
     }
 
@@ -2053,35 +2173,53 @@ def _confirm_step1_event() -> None:
 def render_step1(cfg: dict) -> None:
     st.header("🔍 STEP 1 ― ジャンル選択 → 完全自動イベントリサーチ")
     st.info(
-        "50カテゴリから選ぶか、自由入力欄にジャンル名（例: ゲーム）を入れて\n"
+        "50カテゴリから選ぶか、自由入力欄にジャンル名（例: 食べ物）を入れて\n"
         "「自動リサーチ開始」を押すと、GoogleとGeminiが連動して\n"
         "東京都内・近郊で開催されるイベントを**全自動でリサーチ**します。"
     )
+    st.caption(
+        f"検索モード: **{SEARCH_MODE_LABELS.get(cfg['search_mode'], '展示会中心')}** "
+        "（サイドバーで変更できます）"
+    )
 
-    # ① ジャンル選択（50カテゴリ）
+    # ① ジャンル選択
     selected_label = st.selectbox(
         "📂 イベントジャンル（50カテゴリ）",
         options=GENRE_LABELS,
         index=0,
-        help="リストから選ぶ場合はこちら。自由入力がある場合はそちらが優先されます",
+        help="「9. 食品・飲料」選択時は、下で食品/飲料を複数選べます（酒造・酒類は含みません）",
     )
 
     # ② 自由入力ジャンル（任意・入力時はこちらを優先）
     custom_genre_input = st.text_input(
         "✏️ 自由入力ジャンル（任意）",
-        placeholder="例: ゲーム / eスポーツ / 防災",
-        help="50カテゴリにないジャンルを調べたいときに入力。入力するとプルダウンより優先されます",
+        placeholder="例: 食べ物 / グルメ / eスポーツ / 防災",
+        help="カテゴリ一覧にないジャンルを調べたいときに入力。入力するとプルダウンより優先されます",
     )
 
-    genre, active_label = _resolve_search_genre(selected_label, custom_genre_input)
     using_custom = bool((custom_genre_input or "").strip())
+    food_subtopics: list[str] = []
+    if _is_food_category_label(selected_label) and not using_custom:
+        st.markdown("**🍽️ 食品カテゴリの詳細（複数選択可）**")
+        food_subtopics = st.multiselect(
+            "検索に含める項目（醸造・酒類は対象外）",
+            options=list(FOOD_SUBTOPICS),
+            default=list(FOOD_SUBTOPICS),
+            key="food_subtopic_picker",
+        )
+        if not food_subtopics:
+            st.warning("「食品」または「飲料」を1つ以上選んでください")
+
+    genre, active_label = _resolve_search_genre(
+        selected_label, custom_genre_input, food_subtopics
+    )
 
     if using_custom:
-        st.caption(f"🔎 自由入力 **「{active_label}」** でリサーチします（50カテゴリより優先）")
+        st.caption(f"🔎 自由入力 **「{active_label}」** でリサーチします（カテゴリ一覧より優先）")
 
     # 検索キーワード一覧を表示
     if genre:
-        source = "自由入力" if using_custom else "50カテゴリ"
+        source = "自由入力（自動生成）" if using_custom else "カテゴリ固定"
         with st.expander(f"💡 「{active_label}」の検索キーワード候補（{source}）"):
             st.caption(f"上位 {cfg['max_queries']} 件のキーワードを使用します（サイドバーで変更可）")
             for i, kw in enumerate(genre["keywords"]):
@@ -2100,7 +2238,7 @@ def render_step1(cfg: dict) -> None:
         )
     with col_info:
         if genre is None:
-            st.warning("⬅️ 50カテゴリを選ぶか、自由入力欄にジャンル名を入力してください")
+            st.warning("⬅️ カテゴリを選ぶか、自由入力欄にジャンル名を入力してください")
         else:
             st.caption(
                 f"**対象ジャンル:** {active_label}\n\n"
@@ -2120,7 +2258,11 @@ def render_step1(cfg: dict) -> None:
         # ステップA: SerpAPI（Google検索）
         with st.spinner(f"🔍 Googleで「{active_label}」関連イベントを検索中…"):
             candidates = auto_research_events(
-                genre, cfg["serpapi_key"], cfg["max_queries"], cfg["target_years"]
+                genre,
+                cfg["serpapi_key"],
+                cfg["max_queries"],
+                cfg["target_years"],
+                cfg["search_mode"],
             )
 
         if not candidates:
@@ -2132,7 +2274,11 @@ def render_step1(cfg: dict) -> None:
         # ステップB: Gemini整理
         with st.spinner("🤖 GeminiがイベントリストをAIで整理中（1〜2分かかる場合があります）…"):
             events = validate_events_with_gemini(
-                candidates, active_label, cfg["gemini_api_key"], cfg["target_years"]
+                candidates,
+                active_label,
+                cfg["gemini_api_key"],
+                cfg["target_years"],
+                cfg["search_mode"],
             )
 
         st.session_state.events = events
@@ -2211,6 +2357,20 @@ def render_step1(cfg: dict) -> None:
 # ============================================================
 # STEP2 タブ: 企業リスト収集
 # ============================================================
+
+def _remove_companies_by_indices(indices: set[int]) -> None:
+    """STEP3 前にユーザーが選んだ企業をリストから除外する。"""
+    companies = list(st.session_state.get("companies") or [])
+    remaining = [c for i, c in enumerate(companies) if i not in indices]
+    st.session_state.companies = remaining
+    remain_keys = {_company_key(c) for c in remaining}
+    st.session_state.ai_results = [
+        c for c in (st.session_state.get("ai_results") or [])
+        if _company_key(c) in remain_keys
+    ]
+    st.session_state.filtered_companies = []
+    save_state()
+
 
 def render_step2(cfg: dict) -> None:
     st.header("🏢 STEP 2 ― 企業リスト収集")
@@ -2298,8 +2458,9 @@ def render_step2(cfg: dict) -> None:
             )
 
     if st.session_state.companies:
-        st.subheader(f"📋 収集企業リスト（{len(st.session_state.companies)} 社）")
-        df = pd.DataFrame(st.session_state.companies)
+        companies = st.session_state.companies
+        st.subheader(f"📋 収集企業リスト（{len(companies)} 社）")
+        df = pd.DataFrame(companies)
         show = [c for c in ["name", "url", "event_name", "source"] if c in df.columns]
         st.dataframe(
             df[show].rename(columns={
@@ -2308,13 +2469,49 @@ def render_step2(cfg: dict) -> None:
             }),
             use_container_width=True, hide_index=True,
         )
-        st.success(
-            "✅ この企業リストは自動的に次の工程へ引き継がれます。"
-            "**企業名をタップする必要はありません。**"
+
+        st.divider()
+        st.subheader("📝 リストの手動整理（STEP3 の前）")
+        st.caption(
+            "不要な企業（大手など）をここで削除してから STEP3 へ進むと、"
+            "**Gemini API の消費を抑えられます。**"
         )
+        remove_indices = st.multiselect(
+            "削除する企業（複数選択可）",
+            options=list(range(len(companies))),
+            format_func=lambda i: (
+                f"{companies[i].get('name', '不明')}"
+                + (
+                    f" — {companies[i].get('url', '')[:60]}"
+                    if companies[i].get("url")
+                    else ""
+                )
+            ),
+            key="step2_companies_to_remove",
+        )
+        rm_col1, rm_col2 = st.columns(2)
+        with rm_col1:
+            if st.button(
+                "🗑️ 選択した企業を削除",
+                use_container_width=True,
+                disabled=not remove_indices,
+                key="step2_remove_companies_btn",
+            ):
+                _remove_companies_by_indices(set(remove_indices))
+                st.session_state.pop("step2_companies_to_remove", None)
+                st.rerun()
+        with rm_col2:
+            if st.button(
+                "🔄 削除選択をクリア",
+                use_container_width=True,
+                key="step2_clear_remove_selection",
+            ):
+                st.session_state.pop("step2_companies_to_remove", None)
+                st.rerun()
+
         st.info(
-            "➡️ 次の進み方：画面上部の **「🤖 STEP3: AI絞り込み」タブ** をクリックし、"
-            "**「🤖 AI判定を開始する」ボタン** を押してください。"
+            "➡️ リストを確認・削除したら、画面上部の **「🤖 STEP3: AI絞り込み」** タブを開き、"
+            "**「🤖 AI判定を開始する」** を押してください。"
         )
 
 
@@ -2330,6 +2527,10 @@ def render_step3(cfg: dict) -> None:
         return
 
     total = len(st.session_state.companies)
+    st.caption(
+        f"STEP2 で整理後の **{total} 社** を判定します。"
+        "リストから不要な企業を削除してからここに来ると API 消費を抑えられます。"
+    )
     genre_label = st.session_state.get("selected_genre_label", "不明")
 
     # 既に判定済みの社数（中断後の再開に対応）
