@@ -2010,12 +2010,44 @@ def _event_option_label(event: dict) -> str:
 
 def _select_event_for_step2(event: dict) -> None:
     """STEP2 用にイベントを確定し、後続データをリセットして保存する。"""
-    st.session_state.selected_event = event
+    st.session_state.selected_event = dict(event)
     st.session_state.companies = []
     st.session_state.excluded_companies = []
     st.session_state.ai_results = []
     st.session_state.filtered_companies = []
+    st.session_state._step1_selection_notice = event.get("name", "不明")
     save_state()
+
+
+def _init_step1_event_picker(events: list[dict]) -> None:
+    """イベント選択プルダウンの初期値を同期する（index+key併用エラー回避）。"""
+    if "step1_event_picker" not in st.session_state:
+        st.session_state.step1_event_picker = 0
+
+    selected = st.session_state.get("selected_event")
+    if not selected:
+        return
+
+    for idx, event in enumerate(events):
+        if (
+            event.get("url") == selected.get("url")
+            and event.get("name") == selected.get("name")
+        ):
+            st.session_state.step1_event_picker = idx
+            break
+
+
+def _confirm_step1_event() -> None:
+    """STEP1 の確定ボタン用コールバック。"""
+    events = st.session_state.get("events") or []
+    if not events:
+        st.session_state._step1_selection_notice = ""
+        return
+
+    idx = int(st.session_state.get("step1_event_picker", 0))
+    if idx < 0 or idx >= len(events):
+        idx = 0
+    _select_event_for_step2(events[idx])
 
 
 def render_step1(cfg: dict) -> None:
@@ -2112,6 +2144,8 @@ def render_step1(cfg: dict) -> None:
         st.session_state.ai_results = []
         st.session_state.filtered_companies = []
 
+        save_state()
+
         if events:
             st.success(f"✅ {len(events)} 件のイベントを抽出しました！")
         else:
@@ -2123,41 +2157,39 @@ def render_step1(cfg: dict) -> None:
 
         events = st.session_state.events
         selected = st.session_state.get("selected_event")
+        notice = st.session_state.get("_step1_selection_notice", "")
 
         if selected:
             st.success(
                 f"✅ **選択中:** {selected.get('name', '不明')}　"
                 "→ 画面上部の **「🏢 STEP2: 企業収集」** タブを開いてください"
             )
+        elif notice:
+            st.warning(
+                f"⚠️ 直前に「{notice}」を選ぼうとしましたが、選択が保存されていません。"
+                "もう一度ボタンを押すか、ページを再読み込みしてください。"
+            )
 
         event_labels = [_event_option_label(e) for e in events]
-        picked_idx = 0
-        if selected:
-            for idx, event in enumerate(events):
-                if (
-                    event.get("url") == selected.get("url")
-                    and event.get("name") == selected.get("name")
-                ):
-                    picked_idx = idx
-                    break
+        _init_step1_event_picker(events)
 
         st.caption("👇 リストからイベントを選び、下のボタンで STEP2 に進んでください")
-        chosen_idx = st.selectbox(
+        st.selectbox(
             "📌 営業対象にするイベント",
             options=list(range(len(events))),
             format_func=lambda i: event_labels[i],
-            index=picked_idx,
             key="step1_event_picker",
         )
 
-        if st.button(
+        st.button(
             "✅ このイベントを選択して STEP2 へ進む",
             type="primary",
             use_container_width=True,
             key="step1_confirm_event",
-        ):
-            _select_event_for_step2(events[chosen_idx])
-            st.rerun()
+            on_click=_confirm_step1_event,
+        )
+
+        chosen_idx = int(st.session_state.get("step1_event_picker", 0))
 
         st.divider()
         st.caption("各イベントの詳細")
@@ -2183,8 +2215,13 @@ def render_step1(cfg: dict) -> None:
 def render_step2(cfg: dict) -> None:
     st.header("🏢 STEP 2 ― 企業リスト収集")
 
-    if not st.session_state.selected_event:
-        st.info("👆 STEP1 でイベントを選択してください")
+    if not st.session_state.get("selected_event"):
+        st.info("👆 STEP1 でイベントを選び、**「✅ このイベントを選択して STEP2 へ進む」** を押してください")
+        if st.session_state.get("events"):
+            st.caption(
+                f"STEP1 には {len(st.session_state.events)} 件のイベントがあります。"
+                "ボタン押下後、ここに選択中イベントが表示されます。"
+            )
         return
 
     event = st.session_state.selected_event
