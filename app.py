@@ -2060,7 +2060,10 @@ def render_sidebar() -> dict:
         max_queries = st.slider(
             "ジャンルキーワードの使用数",
             min_value=1, max_value=5, value=5,
-            help="多いほど多くのイベントを発見できますが、検索APIの消費が増えます",
+            help=(
+                "STEP1「検索キーワード候補」で ✅ が付く件数（上から順）。"
+                "多いほどイベントを拾いやすいですが、検索APIの消費が増えます"
+            ),
         )
 
         st.subheader("📅 対象年（未来の開催のみ）")
@@ -2241,6 +2244,9 @@ def render_step1(cfg: dict) -> None:
     food_subtopics: list[str] = []
     if _is_food_category_label(selected_label) and not using_custom:
         st.markdown("**🍽️ 食品カテゴリの詳細（複数選択可）**")
+        st.caption(
+            "緑のタグの **×** で外す、下の欄から選んで足す、で「食品」「飲料」の対象を変えられます"
+        )
         food_subtopics = st.multiselect(
             "検索に含める項目（醸造・酒類は対象外）",
             options=list(FOOD_SUBTOPICS),
@@ -2261,7 +2267,13 @@ def render_step1(cfg: dict) -> None:
     if genre:
         source = "自由入力（自動生成）" if using_custom else "カテゴリ固定"
         with st.expander(f"💡 「{active_label}」の検索キーワード候補（{source}）"):
-            st.caption(f"上位 {cfg['max_queries']} 件のキーワードを使用します（サイドバーで変更可）")
+            st.caption(
+                f"今回 **{cfg['max_queries']} 件** を Google 検索に使います。"
+                "件数は左サイドバー「ジャンルキーワードの使用数」スライダーで変更できます。"
+            )
+            st.caption(
+                "✅＝今回使用　⬜＝今回は未使用（表示のみ・クリック不可。上から順に ✅ が付きます）"
+            )
             for i, kw in enumerate(genre["keywords"]):
                 mark = "✅" if i < cfg["max_queries"] else "⬜"
                 st.markdown(f"{mark} `{kw}`")
