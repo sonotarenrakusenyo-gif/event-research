@@ -2424,6 +2424,43 @@ def _remove_companies_by_indices(indices: set[int]) -> None:
     save_state()
 
 
+def _company_indices_matching_queries(
+    companies: list[dict],
+    queries: list[str],
+) -> set[int]:
+    """企業名・URL にクエリのいずれかが部分一致するインデックスを返す。"""
+    needles = [q.strip().lower() for q in queries if q and q.strip()]
+    if not needles:
+        return set()
+    matched: set[int] = set()
+    for i, company in enumerate(companies):
+        haystack = " ".join(
+            filter(
+                None,
+                [
+                    company.get("name") or "",
+                    company.get("url") or "",
+                ],
+            )
+        ).lower()
+        if any(n in haystack for n in needles):
+            matched.add(i)
+    return matched
+
+
+def _parse_bulk_delete_lines(text: str) -> list[str]:
+    """一括削除用テキスト（改行・カンマ区切り）をクエリリストに分解する。"""
+    if not text or not text.strip():
+        return []
+    parts: list[str] = []
+    for line in text.splitlines():
+        for chunk in re.split(r"[,、\t]", line):
+            chunk = chunk.strip()
+            if chunk:
+                parts.append(chunk)
+    return parts
+
+
 def render_step2(cfg: dict) -> None:
     st.header("🏢 STEP 2 ― 企業リスト収集")
 
@@ -2541,23 +2578,106 @@ def render_step2(cfg: dict) -> None:
             ),
             key="step2_companies_to_remove",
         )
-        rm_col1, rm_col2 = st.columns(2)
-        with rm_col1:
+        sel_col1, sel_col2, sel_col3 = st.columns(3)
+        with sel_col1:
             if st.button(
-                "🗑️ 選択した企業を削除",
+                "✅ 表示リストをすべて選択",
                 use_container_width=True,
-                disabled=not remove_indices,
-                key="step2_remove_companies_btn",
+                key="step2_select_all_companies",
             ):
-                _remove_companies_by_indices(set(remove_indices))
-                st.session_state.pop("step2_companies_to_remove", None)
+                st.session_state["step2_companies_to_remove"] = list(range(len(companies)))
                 st.rerun()
-        with rm_col2:
+        with sel_col2:
             if st.button(
                 "🔄 削除選択をクリア",
                 use_container_width=True,
                 key="step2_clear_remove_selection",
             ):
+                st.session_state.pop("step2_companies_to_remove", None)
+                st.rerun()
+        with sel_col3:
+            st.caption(f"選択中: **{len(remove_indices)}** / {len(companies)} 社")
+
+        if st.button(
+            "🗑️ 選択した企業を一括削除",
+            use_container_width=True,
+            disabled=not remove_indices,
+            key="step2_remove_companies_btn",
+        ):
+            _remove_companies_by_indices(set(remove_indices))
+            st.session_state.pop("step2_companies_to_remove", None)
+            st.rerun()
+
+        with st.expander("📋 企業名・キーワードで一括削除", expanded=False):
+            st.caption(
+                "ドロップダウンで1件ずつ選ばなくても、ここからまとめて削除できます。"
+            )
+            bulk_text = st.text_area(
+                "削除したい企業名（1行1件、またはカンマ区切り・部分一致）",
+                placeholder="キリンホールディングス\nサントリー\nコカ・コーラ",
+                height=120,
+                key="step2_bulk_delete_text",
+            )
+            bulk_keyword = st.text_input(
+                "またはキーワード（企業名・URL に含まれる文字列）",
+                placeholder="例: ホールディングス、株式会社",
+                key="step2_bulk_delete_keyword",
+            )
+            bulk_queries = _parse_bulk_delete_lines(bulk_text)
+            if bulk_keyword.strip():
+                bulk_queries.append(bulk_keyword.strip())
+            bulk_match = _company_indices_matching_queries(companies, bulk_queries)
+            if bulk_queries:
+                st.caption(f"条件に一致: **{len(bulk_match)}** 社")
+                if bulk_match:
+                    preview_names = [
+                        companies[i].get("name", "不明") for i in sorted(bulk_match)[:8]
+                    ]
+                    more = len(bulk_match) - len(preview_names)
+                    preview = "、".join(preview_names)
+                    if more > 0:
+                        preview += f" …他 {more} 社"
+                    st.text(preview)
+
+            bulk_col1, bulk_col2 = st.columns(2)
+            with bulk_col1:
+                if st.button(
+                    "➕ 一致した企業を削除選択に追加",
+                    use_container_width=True,
+                    disabled=not bulk_match,
+                    key="step2_bulk_add_to_selection",
+                ):
+                    current = set(st.session_state.get("step2_companies_to_remove") or [])
+                    st.session_state["step2_companies_to_remove"] = sorted(
+                        current | bulk_match
+                    )
+                    st.rerun()
+            with bulk_col2:
+                if st.button(
+                    "🗑️ 一致した企業を今すぐ一括削除",
+                    use_container_width=True,
+                    disabled=not bulk_match,
+                    type="primary",
+                    key="step2_bulk_delete_now",
+                ):
+                    _remove_companies_by_indices(bulk_match)
+                    st.session_state.pop("step2_companies_to_remove", None)
+                    st.session_state.pop("step2_bulk_delete_text", None)
+                    st.session_state.pop("step2_bulk_delete_keyword", None)
+                    st.rerun()
+
+        with st.expander("⚠️ 収集リストを全件削除", expanded=False):
+            st.warning("残っている企業をすべて削除します。STEP2 で再収集が必要になります。")
+            confirm_clear_all = st.checkbox(
+                "全件削除する内容を理解しました",
+                key="step2_confirm_delete_all",
+            )
+            if st.button(
+                "🗑️ リストを全件削除",
+                disabled=not confirm_clear_all,
+                key="step2_delete_all_companies",
+            ):
+                _remove_companies_by_indices(set(range(len(companies))))
                 st.session_state.pop("step2_companies_to_remove", None)
                 st.rerun()
 
